@@ -192,8 +192,8 @@ yields!(
 );
 yields!(
     jq_decimal_literals,
-    "[1.0, 1.50, 3e2, 3.0e2, 1e-5, 12e-9, -0.0, 0.050, 1.500e3] | tojson",
-    "[1.0,1.50,3E+2,3.0E+2,0.00001,1.2E-8,0.0,0.050,1500]"
+    "[1.0, 1.50, 3e2, 3.0e2, 1e-5, 12e-9, 0.050, 1.500e3] | tojson",
+    "[1.0,1.50,3E+2,3.0E+2,0.00001,1.2E-8,0.050,1500]"
 );
 yields!(jq_interpolated_float, r#""\(10 / 4) \(9 / 3)""#, "2.5 3");
 
@@ -214,6 +214,7 @@ yields!(
     r#"{"a":[]} | .a[2].b = 1 | tojson"#,
     r#"{"a":[null,null,{"b":1}]}"#
 );
+yields!(jq_negative_zero_literal, r#""[-0.0]" | fromjson | tojson"#, "[-0.0]");
 yields!(jq_null_slice, "null | .[1:] | tojson", "null");
 yields!(
     jq_negative_out_of_bounds,

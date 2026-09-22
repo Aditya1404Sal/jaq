@@ -462,7 +462,7 @@ fn fmt_jq_dec(f: &mut fmt::Formatter, literal: &str) -> fmt::Result {
     let count = digits.len() as i64;
     let exponent = exponent - fraction.len() as i64;
     let adjusted = exponent + count - 1;
-    if negative && digits != "0" {
+    if negative {
         write!(f, "-")?;
     }
     if exponent <= 0 && adjusted >= -6 {
