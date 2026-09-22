@@ -161,6 +161,10 @@ impl jaq_core::ValT for Val {
     }
 
     fn range(self, range: val::Range<&Self>) -> ValR {
+        // jq slices null to null.
+        if let Val::Null = self {
+            return Ok(Val::Null);
+        }
         let fs = |b: Bytes, range, skip_take: SkipTakeFn| {
             Self::range_int(range)
                 .map(|range_char| skip_take(range_char, &b))
@@ -206,6 +210,12 @@ impl jaq_core::ValT for Val {
             return self.map_range(range, opt, f);
         };
         match self {
+            // jq treats null as an empty object or array when updating it by key or index.
+            Val::Null => match index {
+                Val::TStr(_) | Val::BStr(_) => Val::obj(Map::default()).map_index(index, opt, f),
+                Val::Num(n) if n.is_int() => Val::Arr(Rc::new(Vec::new())).map_index(index, opt, f),
+                _ => opt.fail(self, |v| Exn::from(Error::typ(v, Type::Iter.as_str()))),
+            },
             Val::Obj(ref mut o) => {
                 use indexmap::map::Entry::{Occupied, Vacant};
                 match Rc::make_mut(o).entry(index.clone()) {
@@ -227,14 +237,22 @@ impl jaq_core::ValT for Val {
                 Ok(self)
             }
             Val::Arr(ref mut a) => {
-                let oob = || Error::str(format_args!("index {index} out of bounds"));
-                let abs_or = |i| abs_index(i, a.len()).ok_or_else(oob);
+                let oob = || Error::str("Out of bounds negative array index");
+                let len = a.len();
+                // Like jq, a non-negative index past the end extends the array with nulls.
+                let abs_or = |i: num::PosUsize| match i {
+                    num::PosUsize(true, i) => Ok(i),
+                    i => abs_index(i, len).ok_or_else(oob),
+                };
                 let i = match index.as_pos_usize().and_then(abs_or) {
                     Ok(i) => i,
                     Err(e) => return opt.fail(self, |_| Exn::from(e)),
                 };
 
                 let a = Rc::make_mut(a);
+                if i >= a.len() {
+                    a.resize(i + 1, Val::Null);
+                }
                 let x = core::mem::take(&mut a[i]);
                 if let Some(y) = f(x).next().transpose()? {
                     a[i] = y;

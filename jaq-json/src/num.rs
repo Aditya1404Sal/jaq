@@ -394,15 +394,93 @@ fn float_cmp(left: f64, right: f64) -> Ordering {
 }
 
 impl fmt::Display for Num {
+    /// Print numbers as jq 1.8 does: NaN as `null`, infinities as the largest finite doubles,
+    /// computed doubles in jq's shortest `%g`-like form, and decimal literals canonically.
     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
         match self {
             Self::Int(i) => write!(f, "{i}"),
             Self::BigInt(i) => write!(f, "{i}"),
-            Self::Float(x) if x.is_nan() => write!(f, "NaN"),
-            Self::Float(f64::INFINITY) => write!(f, "Infinity"),
-            Self::Float(f64::NEG_INFINITY) => write!(f, "-Infinity"),
-            Self::Float(x) => ryu::Buffer::new().format_finite(*x).fmt(f),
-            Self::Dec(n) => write!(f, "{n}"),
+            Self::Float(x) if x.is_nan() => write!(f, "null"),
+            Self::Float(x) if x.is_infinite() => fmt_jq_float(f, x.signum() * f64::MAX),
+            Self::Float(x) => fmt_jq_float(f, *x),
+            Self::Dec(n) => fmt_jq_dec(f, n),
         }
+    }
+}
+
+/// jq's `jvp_dtoa_fmt`: shortest round-trip digits; exponential with a signed, at least
+/// two-digit exponent when the decimal point is 4+ places left of the digits or more than 15
+/// places right of them.
+fn fmt_jq_float(f: &mut fmt::Formatter, x: f64) -> fmt::Result {
+    if x == 0.0 {
+        return write!(f, "0");
+    }
+    let scientific = alloc::format!("{:e}", x.abs());
+    let (mantissa, exponent) = scientific.split_once('e').unwrap_or((&scientific, "0"));
+    let exponent: i32 = exponent.parse().unwrap_or(0);
+    let digits: alloc::string::String = mantissa.chars().filter(|c| *c != '.').collect();
+    let count = digits.len() as i32;
+    let point = exponent + 1;
+    if x < 0.0 {
+        write!(f, "-")?;
+    }
+    if point <= -4 || point > count + 15 {
+        write!(f, "{}", &digits[..1])?;
+        if count > 1 {
+            write!(f, ".{}", &digits[1..])?;
+        }
+        let power = point - 1;
+        let sign = if power < 0 { '-' } else { '+' };
+        write!(f, "e{sign}{:02}", power.abs())
+    } else if point <= 0 {
+        write!(f, "0.{}{digits}", "0".repeat(point.unsigned_abs() as usize))
+    } else if point >= count {
+        write!(f, "{digits}{}", "0".repeat((point - count) as usize))
+    } else {
+        let point = point as usize;
+        write!(f, "{}.{}", &digits[..point], &digits[point..])
+    }
+}
+
+/// decNumber's to-scientific-string, which jq 1.8 uses for number literals it preserves.
+fn fmt_jq_dec(f: &mut fmt::Formatter, literal: &str) -> fmt::Result {
+    let (negative, rest) = match literal.strip_prefix('-') {
+        Some(rest) => (true, rest),
+        None => (false, literal.strip_prefix('+').unwrap_or(literal)),
+    };
+    let (mantissa, exponent) = match rest.find(['e', 'E']) {
+        Some(index) => (&rest[..index], rest[index + 1..].parse::<i64>()),
+        None => (rest, Ok(0)),
+    };
+    let Ok(exponent) = exponent else {
+        return write!(f, "{literal}");
+    };
+    let (integer, fraction) = mantissa.split_once('.').unwrap_or((mantissa, ""));
+    let joined = alloc::format!("{integer}{fraction}");
+    let trimmed = joined.trim_start_matches('0');
+    let digits = if trimmed.is_empty() { "0" } else { trimmed };
+    let count = digits.len() as i64;
+    let exponent = exponent - fraction.len() as i64;
+    let adjusted = exponent + count - 1;
+    if negative && digits != "0" {
+        write!(f, "-")?;
+    }
+    if exponent <= 0 && adjusted >= -6 {
+        let point = count + exponent;
+        if exponent == 0 {
+            write!(f, "{digits}")
+        } else if point > 0 {
+            let point = point as usize;
+            write!(f, "{}.{}", &digits[..point], &digits[point..])
+        } else {
+            write!(f, "0.{}{digits}", "0".repeat(point.unsigned_abs() as usize))
+        }
+    } else {
+        write!(f, "{}", &digits[..1])?;
+        if count > 1 {
+            write!(f, ".{}", &digits[1..])?;
+        }
+        let sign = if adjusted < 0 { '-' } else { '+' };
+        write!(f, "E{sign}{}", adjusted.abs())
     }
 }

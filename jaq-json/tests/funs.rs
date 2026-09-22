@@ -13,7 +13,11 @@ yields!(bsearch_present, "[1, 3] | [bsearch(1, 3)]", [0, 1]);
 yields!(
     fromjson_inf,
     r#""Infinity +Infinity -Infinity" | [fromjson | tostring]"#,
-    ["Infinity", "Infinity", "-Infinity"]
+    [
+        "1.7976931348623157e+308",
+        "1.7976931348623157e+308",
+        "-1.7976931348623157e+308"
+    ]
 );
 yields!(fromjson_uint, r#"" 1" | fromjson"#, 1);
 yields!(fromjson_pint, r#""+1" | fromjson"#, 1);
@@ -72,9 +76,13 @@ yields!(length_float_neg, "-2.5 | length", 2.5);
 
 yields!(tojson_fl0, "1.0 | tojson", "1.0");
 yields!(tojson_fl1, "1.1 | tojson", "1.1");
-yields!(tojson_nan, "0.0 / 0.0 | tojson", "NaN");
-yields!(tojson_inf, "1.0 / 0.0 | tojson", "Infinity");
-yields!(tojson_ninf, "-1.0 / 0.0 | tojson", "-Infinity");
+yields!(tojson_nan, "0.0 / 0.0 | tojson", "null");
+yields!(tojson_inf, "1.0 / 0.0 | tojson", "1.7976931348623157e+308");
+yields!(
+    tojson_ninf,
+    "-1.0 / 0.0 | tojson",
+    "-1.7976931348623157e+308"
+);
 
 #[test]
 fn tonumber() {
@@ -173,4 +181,42 @@ yields!(
     format_urid_invalid,
     r#"("%FF" | @urid) == ([255] | tobytes | tostring)"#,
     true
+);
+
+// jq 1.8 compatibility: number printing.
+yields!(jq_integral_float, "10 / 2 | tojson", "5");
+yields!(
+    jq_float_forms,
+    "[0.00001 * 1, 1e17 * 1, 1 / 3, 1.5e300 * 1, 123456789012 * 1, 0.0001 * 1] | tojson",
+    "[1e-05,1e+17,0.3333333333333333,1.5e+300,123456789012,0.0001]"
+);
+yields!(
+    jq_decimal_literals,
+    "[1.0, 1.50, 3e2, 3.0e2, 1e-5, 12e-9, -0.0, 0.050, 1.500e3] | tojson",
+    "[1.0,1.50,3E+2,3.0E+2,0.00001,1.2E-8,0.0,0.050,1500]"
+);
+yields!(jq_interpolated_float, r#""\(10 / 4) \(9 / 3)""#, "2.5 3");
+
+// jq 1.8 compatibility: updates create structure through null and past array ends.
+yields!(
+    jq_null_key_update,
+    r#"null | .a.b = 1 | tojson"#,
+    r#"{"a":{"b":1}}"#
+);
+yields!(jq_null_index_update, "null | .[1] = 1 | tojson", "[null,1]");
+yields!(
+    jq_array_extension,
+    "[1] | .[3] = 4 | tojson",
+    "[1,null,null,4]"
+);
+yields!(
+    jq_nested_extension,
+    r#"{"a":[]} | .a[2].b = 1 | tojson"#,
+    r#"{"a":[null,null,{"b":1}]}"#
+);
+yields!(jq_null_slice, "null | .[1:] | tojson", "null");
+yields!(
+    jq_negative_out_of_bounds,
+    "[1] | try (.[-5] = 9) catch .",
+    "Out of bounds negative array index"
 );
