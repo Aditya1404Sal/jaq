@@ -2,13 +2,28 @@
 
 pub mod common;
 
-use common::give;
+use common::{fail, give};
+use jaq_json::Error;
 use serde_json::json;
 
 yields!(bsearch_absent1, "[1, 3] | bsearch(0)", -1);
 yields!(bsearch_absent2, "[1, 3] | bsearch(2)", -2);
 yields!(bsearch_absent3, "[1, 3] | bsearch(4)", -3);
 yields!(bsearch_present, "[1, 3] | [bsearch(1, 3)]", [0, 1]);
+
+// FA-070: `"a" * 4294967296` used to abort the whole (sandboxed) process attempting the
+// allocation instead of refusing — jq itself refuses any repeat past `INT_MAX` result bytes,
+// but even a sub-`INT_MAX` allocation this large aborts the sandbox, so the cap here is a real
+// platform limit, well below jq's own (see `MAX_REPEATED_STRING_LEN`'s own doc comment).
+#[test]
+fn string_repeat_refuses_rather_than_aborts() {
+    give(json!(null), r#""ab" | . * 100"#, json!("ab".repeat(100)));
+    fail(
+        json!(null),
+        "\"a\" * 4294967296",
+        Error::str("Repeat string result too long"),
+    );
+}
 
 // Like jq, an index past the end extends the array with nulls, up to jq's limit of
 // `INT_MAX >> 2`; past it jq refuses instead of allocating.
