@@ -1,11 +1,10 @@
-use crate::{read, Error, Val, ValR, ValX};
+use crate::{jv_parse, Error, Val, ValR};
 use alloc::{boxed::Box, vec::Vec};
 use bstr::ByteSlice;
 use bytes::{BufMut, Bytes, BytesMut};
-use core::fmt;
-use jaq_core::box_iter::{then, BoxIter};
+use jaq_core::box_iter::BoxIter;
 use jaq_core::native::{bome, run, unary, v, Filter, Fun};
-use jaq_core::{DataT, Exn, RunPtr};
+use jaq_core::{DataT, RunPtr};
 use jaq_std::ValT as _;
 
 impl Val {
@@ -49,7 +48,7 @@ impl Val {
                 let ix = x.iter().enumerate();
                 Ok(Box::new(ix.filter_map(move |(i, x)| (x == y).then_some(i))))
             }
-            (x, y) => Err(Error::index(x.clone(), y.clone())),
+            (x, y) => Err(crate::index_type_error(x, y)),
         }
     }
 
@@ -113,15 +112,6 @@ impl Val {
     }
 }
 
-/// Box Map, Map Error.
-fn bmme<'a>(iter: BoxIter<'a, ValR>) -> BoxIter<'a, ValX<'a>> {
-    Box::new(iter.map(|r| r.map_err(Exn::from)))
-}
-
-fn parse_fail(i: &impl fmt::Display, fmt: &str, e: impl fmt::Display) -> Error {
-    Error::str(format_args!("cannot parse {i} as {fmt}: {e}"))
-}
-
 self_cell::self_cell!(
     struct BytesValRs {
         owner: Bytes,
@@ -152,11 +142,31 @@ pub fn funs<D: for<'a> DataT<V<'a> = Val>>() -> impl Iterator<Item = Fun<D>> {
 
 fn base<D: for<'a> DataT<V<'a> = Val>>() -> Box<[Filter<RunPtr<D>>]> {
     Box::new([
+        // jq 1.8's `fromjson`, `tonumber` and `toboolean`, with its messages.
         ("fromjson", v(0), |cv| {
-            bmme(then(cv.1.try_as_utf8_bytes_owned(), |s| {
-                let fail = move |r: Result<_, _>| r.map_err(|e| parse_fail(&cv.1, "JSON", e));
-                bytes_valrs(s, |s| Box::new(read::parse_many(s).map(fail)))
-            }))
+            bome(match &cv.1 {
+                Val::TStr(s) => jv_parse::parse_sized(s).map_err(Error::str),
+                v => Err(crate::type_error(v, "only strings can be parsed")),
+            })
+        }),
+        ("tonumber", v(0), |cv| {
+            let message = "cannot be parsed as a number";
+            bome(match &cv.1 {
+                Val::Num(_) => Ok(cv.1.clone()),
+                // jq reads the string as a C string: a NUL in it fails.
+                Val::TStr(s) if !s.contains(&0) => jv_parse::number_literal(s)
+                    .map(Val::Num)
+                    .ok_or_else(|| crate::type_error(&cv.1, message)),
+                v => Err(crate::type_error(v, message)),
+            })
+        }),
+        ("toboolean", v(0), |cv| {
+            bome(match &cv.1 {
+                Val::Bool(_) => Ok(cv.1.clone()),
+                Val::TStr(s) if &***s == b"true" => Ok(Val::Bool(true)),
+                Val::TStr(s) if &***s == b"false" => Ok(Val::Bool(false)),
+                v => Err(crate::type_error(v, "cannot be parsed as a boolean")),
+            })
         }),
         ("tojson", v(0), |cv| bome(Ok(Val::utf8_str(cv.1.to_json())))),
         ("tobytes", v(0), |cv| {

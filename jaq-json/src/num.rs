@@ -60,7 +60,19 @@ impl Num {
     }
 
     pub(crate) fn is_int(&self) -> bool {
-        matches!(self, Self::Int(_) | Self::BigInt(_))
+        matches!(self, Self::Int(_) | Self::BigInt(_)) || self.integral_float().is_some()
+    }
+
+    /// A double (or decimal) with no fractional part that fits a machine-sized integer, which
+    /// jq uses as that integer (`-1 * 0` is jq's `-0`, and still indexes like `0`).
+    fn integral_float(&self) -> Option<isize> {
+        let f = match self {
+            Self::Float(f) => *f,
+            Self::Dec(n) => n.parse().ok()?,
+            _ => return None,
+        };
+        let range = isize::MIN as f64..isize::MAX as f64;
+        (f.fract() == 0.0 && range.contains(&f)).then_some(f as isize)
     }
 
     /// If the value is a machine-sized integer, return it, else fail.
@@ -68,7 +80,7 @@ impl Num {
         match self {
             Self::Int(i) => Some(*i),
             Self::BigInt(i) => i.to_isize(),
-            _ => None,
+            _ => self.integral_float(),
         }
     }
 
@@ -79,7 +91,9 @@ impl Num {
                 .magnitude()
                 .to_usize()
                 .map(|u| PosUsize(i.sign() != Sign::Minus, u)),
-            _ => None,
+            _ => self
+                .integral_float()
+                .map(|i| PosUsize(i >= 0, i.unsigned_abs())),
         }
     }
 
@@ -163,17 +177,63 @@ fn biguint_from_str_radix(s: &str, radix: u32) -> Option<BigUint> {
     BigUint::from_radix_be(&digits.collect::<Option<Vec<_>>>()?, radix)
 }
 
+/// Integers of at most this magnitude are exact as doubles. jq computes on doubles, so an
+/// integer operand or result past it becomes the double jq would have.
+const EXACT_INT: i128 = 1 << 53;
+
+/// `+`, `-` or `*` of two integers as jq computes them: exactly while operands and result are
+/// within [`EXACT_INT`], else in doubles.
+fn int_arith(x: isize, y: isize, exact: fn(i128, i128) -> i128, float: fn(f64, f64) -> f64) -> Num {
+    let (a, b) = (x as i128, y as i128);
+    if a.abs() > EXACT_INT || b.abs() > EXACT_INT {
+        return Num::Float(float(x as f64, y as f64));
+    }
+    let r = exact(a, b);
+    if r.abs() > EXACT_INT {
+        Num::Float(r as f64)
+    } else if r == 0 && float(a as f64, b as f64).is_sign_negative() {
+        // `0 * -1` is jq's `-0`.
+        Num::Float(-0.0)
+    } else {
+        exact_int(r)
+    }
+}
+
+/// An integer within [`EXACT_INT`], as a machine-sized integer where it fits (`isize` may be
+/// 32 bits wide).
+fn exact_int(r: i128) -> Num {
+    isize::try_from(r).map_or_else(|_| Num::big_int(BigInt::from(r)), Num::Int)
+}
+
+fn big_f64(i: &BigInt) -> f64 {
+    // `BigInt::to_f64` always yields `Some`, rounding large values to infinity.
+    i.to_f64().unwrap_or(f64::NAN)
+}
+
+/// jq's `dtoi`: a double to `intmax_t`, saturating.
+pub(crate) fn dtoi(n: f64) -> i64 {
+    // Rust's `as` saturates too; NaN has been ruled out by the caller.
+    n as i64
+}
+
+impl Num {
+    /// Whether jq's `%` would refuse this divisor: one that truncates to 0.
+    pub(crate) fn is_zero_divisor(&self) -> bool {
+        let f = self.as_f64();
+        !f.is_nan() && dtoi(f) == 0
+    }
+}
+
 impl core::ops::Add for Num {
     type Output = Num;
     fn add(self, rhs: Self) -> Self::Output {
-        use num_bigint::BigInt;
         use Num::*;
         match (self, rhs) {
-            (Int(x), Int(y)) => int_or_big(x.checked_add(y), [x, y], |[x, y]| x + y),
-            (Int(i), BigInt(b)) | (BigInt(b), Int(i)) => Self::big_int(&BigInt::from(i) + &*b),
+            (Int(x), Int(y)) => int_arith(x, y, |x, y| x + y, |x, y| x + y),
+            (Int(i), BigInt(b)) | (BigInt(b), Int(i)) => Float(i as f64 + big_f64(&b)),
             (Int(i), Float(f)) | (Float(f), Int(i)) => Float(f + i as f64),
-            (BigInt(x), BigInt(y)) => Self::big_int(&*x + &*y),
-            (BigInt(i), Float(f)) | (Float(f), BigInt(i)) => Float(f + i.to_f64().unwrap()),
+            (BigInt(x), BigInt(y)) => Float(big_f64(&x) + big_f64(&y)),
+            (BigInt(i), Float(f)) | (Float(f), BigInt(i)) => Float(f + big_f64(&i)),
             (Float(x), Float(y)) => Float(x + y),
             (Dec(n), r) => Self::from_dec_str(&n) + r,
             (l, Dec(n)) => l + Self::from_dec_str(&n),
@@ -184,17 +244,16 @@ impl core::ops::Add for Num {
 impl core::ops::Sub for Num {
     type Output = Self;
     fn sub(self, rhs: Self) -> Self::Output {
-        use num_bigint::BigInt;
         use Num::*;
         match (self, rhs) {
-            (Int(x), Int(y)) => int_or_big(x.checked_sub(y), [x, y], |[x, y]| x - y),
-            (Int(i), BigInt(b)) => Self::big_int(&BigInt::from(i) - &*b),
-            (BigInt(b), Int(i)) => Self::big_int(&*b - &BigInt::from(i)),
-            (BigInt(x), BigInt(y)) => Self::big_int(&*x - &*y),
+            (Int(x), Int(y)) => int_arith(x, y, |x, y| x - y, |x, y| x - y),
+            (Int(i), BigInt(b)) => Float(i as f64 - big_f64(&b)),
+            (BigInt(b), Int(i)) => Float(big_f64(&b) - i as f64),
+            (BigInt(x), BigInt(y)) => Float(big_f64(&x) - big_f64(&y)),
             (Float(f), Int(i)) => Float(f - i as f64),
             (Int(i), Float(f)) => Float(i as f64 - f),
-            (Float(f), BigInt(i)) => Float(f - i.to_f64().unwrap()),
-            (BigInt(i), Float(f)) => Float(i.to_f64().unwrap() - f),
+            (Float(f), BigInt(i)) => Float(f - big_f64(&i)),
+            (BigInt(i), Float(f)) => Float(big_f64(&i) - f),
             (Float(x), Float(y)) => Float(x - y),
             (Dec(n), r) => Self::from_dec_str(&n) - r,
             (l, Dec(n)) => l - Self::from_dec_str(&n),
@@ -205,14 +264,12 @@ impl core::ops::Sub for Num {
 impl core::ops::Mul for Num {
     type Output = Self;
     fn mul(self, rhs: Self) -> Self::Output {
-        use num_bigint::BigInt;
         use Num::*;
         match (self, rhs) {
-            (Int(x), Int(y)) => int_or_big(x.checked_mul(y), [x, y], |[x, y]| x * y),
-
-            (Int(i), BigInt(b)) | (BigInt(b), Int(i)) => Self::big_int(&BigInt::from(i) * &*b),
-            (BigInt(x), BigInt(y)) => Self::big_int(&*x * &*y),
-            (BigInt(i), Float(f)) | (Float(f), BigInt(i)) => Float(f * i.to_f64().unwrap()),
+            (Int(x), Int(y)) => int_arith(x, y, |x, y| x * y, |x, y| x * y),
+            (Int(i), BigInt(b)) | (BigInt(b), Int(i)) => Float(i as f64 * big_f64(&b)),
+            (BigInt(x), BigInt(y)) => Float(big_f64(&x) * big_f64(&y)),
+            (BigInt(i), Float(f)) | (Float(f), BigInt(i)) => Float(f * big_f64(&i)),
             (Float(f), Int(i)) | (Int(i), Float(f)) => Float(f * i as f64),
             (Float(x), Float(y)) => Float(x * y),
             (Dec(n), r) => Self::from_dec_str(&n) * r,
@@ -228,8 +285,8 @@ impl core::ops::Div for Num {
         match (self, rhs) {
             (Int(l), r) => Float(l as f64) / r,
             (l, Int(r)) => l / Float(r as f64),
-            (BigInt(l), r) => Float(l.to_f64().unwrap()) / r,
-            (l, BigInt(r)) => l / Float(r.to_f64().unwrap()),
+            (BigInt(l), r) => Float(big_f64(&l)) / r,
+            (l, BigInt(r)) => l / Float(big_f64(&r)),
             (Float(x), Float(y)) => Float(x / y),
             (Dec(n), r) => Self::from_dec_str(&n) / r,
             (l, Dec(n)) => l / Self::from_dec_str(&n),
@@ -239,25 +296,39 @@ impl core::ops::Div for Num {
 
 impl core::ops::Rem for Num {
     type Output = Self;
+    /// jq's `%`: NaN if either side is NaN, else both sides truncated to integers (`dtoi`) and
+    /// the C remainder of those. A divisor that truncates to 0 is refused by `Val`.
     fn rem(self, rhs: Self) -> Self::Output {
-        use num_bigint::BigInt;
-        use Num::*;
+        use Num::Int;
         match (self, rhs) {
-            // `x.checked_rem(y)` is `None` only for:
-            //
-            // - `isize::MIN % -1`: The remainder is always 0.
-            // - `x % 0`: This is guarded by `Val`.
-            (Int(x), Int(y)) => Int(x.checked_rem(y).unwrap_or(0)),
-            (BigInt(x), BigInt(y)) => Num::big_int(&*x % &*y),
-            (Int(i), BigInt(b)) => Num::big_int(&BigInt::from(i) % &*b),
-            (BigInt(b), Int(i)) => Num::big_int(&*b % &BigInt::from(i)),
-            (Int(i), Float(f)) => Float(i as f64 % f),
-            (Float(f), Int(i)) => Float(f % i as f64),
-            (BigInt(i), Float(f)) => Float(i.to_f64().unwrap() % f),
-            (Float(f), BigInt(i)) => Float(f % i.to_f64().unwrap()),
-            (Float(x), Float(y)) => Float(x % y),
-            (Dec(n), r) => Self::from_dec_str(&n) % r,
-            (l, Dec(n)) => l % Self::from_dec_str(&n),
+            (Int(x), Int(y))
+                if (x as i128).abs() <= EXACT_INT && (y as i128).abs() <= EXACT_INT =>
+            {
+                // `x % -1` is 0 (jq checks for it, as `INTMAX_MIN % -1` overflows).
+                Int(if y == -1 {
+                    0
+                } else {
+                    x.checked_rem(y).unwrap_or(0)
+                })
+            }
+            (l, r) => {
+                let (x, y) = (l.as_f64(), r.as_f64());
+                if x.is_nan() || y.is_nan() {
+                    return Num::Float(f64::NAN);
+                }
+                let (x, y) = (dtoi(x), dtoi(y));
+                let r = if y == -1 {
+                    0
+                } else {
+                    x.checked_rem(y).unwrap_or(0)
+                };
+                let r = i128::from(r);
+                if r.abs() > EXACT_INT {
+                    Num::Float(r as f64)
+                } else {
+                    exact_int(r)
+                }
+            }
         }
     }
 }
@@ -269,12 +340,23 @@ impl core::ops::Neg for Num {
             Self::Int(x) => int_or_big(x.checked_neg(), [x], |[x]| -x),
             Self::BigInt(x) => Self::big_int(-&*x),
             Self::Float(x) => Self::Float(-x),
+            // decNumber negates as `0 - x`, so a zero literal comes out positive: `-0.0` is `0.0`.
+            Self::Dec(n) if dec_is_zero(&n) => {
+                let pos = n.strip_prefix(['-', '+']).unwrap_or(&n);
+                Self::Dec(pos.to_string().into())
+            }
             Self::Dec(n) => match n.strip_prefix('-') {
                 Some(pos) => Self::Dec(pos.to_string().into()),
-                None => Self::Dec(alloc::format!("-{n}").into()),
+                None => Self::Dec(alloc::format!("-{}", n.strip_prefix('+').unwrap_or(&n)).into()),
             },
         }
     }
+}
+
+/// Whether a decimal literal's value is zero.
+fn dec_is_zero(n: &str) -> bool {
+    let mantissa = n.split(['e', 'E']).next().unwrap_or(n);
+    !mantissa.bytes().any(|b| matches!(b, b'1'..=b'9'))
 }
 
 impl Hash for Num {
@@ -413,7 +495,7 @@ impl fmt::Display for Num {
 /// places right of them.
 fn fmt_jq_float(f: &mut fmt::Formatter, x: f64) -> fmt::Result {
     if x == 0.0 {
-        return write!(f, "0");
+        return write!(f, "{}", if x.is_sign_negative() { "-0" } else { "0" });
     }
     let scientific = alloc::format!("{:e}", x.abs());
     let (mantissa, exponent) = scientific.split_once('e').unwrap_or((&scientific, "0"));

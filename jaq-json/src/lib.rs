@@ -12,6 +12,7 @@ extern crate alloc;
 extern crate std;
 
 mod funs;
+pub mod jv_parse;
 mod num;
 #[macro_use]
 pub mod write;
@@ -127,16 +128,66 @@ fn type_name(v: &Val) -> &'static str {
     }
 }
 
-/// jq's own wording for indexing a container by a key of the wrong type — e.g. `{}[0]` or
-/// `[][{}]` — is `Cannot index TYPE1 with TYPE2 (VALUE)`, always including the index's own
-/// (compact-JSON) value, for every index type. Verified against the oracle for a number,
-/// boolean, null, array and object index into an object.
-fn index_type_error(container: &Val, index: &Val) -> Error {
+/// A value in an error message, as jq's `jv_dump_string_trunc` gives it with the 30-byte
+/// buffer its callers use: the compact JSON text, or when that is longer than 29 bytes, its first
+/// 25 (26 without a closing delimiter) bytes, not splitting a character, then `...` and the
+/// closing `"`, `]` or `}`.
+pub fn dump_trunc(v: &Val) -> String {
+    const BUFSIZE: usize = 30;
+    let text = alloc::string::ToString::to_string(v);
+    if text.len() < BUFSIZE {
+        return text;
+    }
+    let delim = match text.as_bytes()[0] {
+        b'"' => Some('"'),
+        b'[' => Some(']'),
+        b'{' => Some('}'),
+        _ => None,
+    };
+    let mut len = BUFSIZE - if delim.is_some() { 5 } else { 4 };
+    while !text.is_char_boundary(len) {
+        len -= 1;
+    }
+    let mut out = String::from(&text[..len]);
+    out.push_str("...");
+    out.extend(delim);
+    out
+}
+
+/// jq's `type_error`: `TYPE (VALUE) MESSAGE`.
+pub(crate) fn type_error(v: &Val, message: &str) -> Error {
     Error::str(format_args!(
-        "Cannot index {} with {} ({index})",
-        type_name(container),
-        type_name(index)
+        "{} ({}) {message}",
+        type_name(v),
+        dump_trunc(v)
     ))
+}
+
+/// jq's own wording for indexing a value by a key it cannot take — e.g. `{}[0]`, `[][{}]` or
+/// `1 | .a` — is `Cannot index TYPE1 with TYPE2 (VALUE)`, the index's value cut short as
+/// [`dump_trunc`] does. Verified against the oracle for every kind of value and index.
+pub(crate) fn index_type_error(container: &Val, index: &Val) -> Error {
+    Error::str(format_args!(
+        "Cannot index {} with {} ({})",
+        type_name(container),
+        type_name(index),
+        dump_trunc(index)
+    ))
+}
+
+/// An array index as jq's `jv_get` takes it: truncated to an integer (`.[1.5]` is `.[1]`),
+/// with NaN or a value past `int`'s range reading as `null`.
+fn jq_array_index(i: &Num, len: usize) -> Option<usize> {
+    if let Some(i) = i.as_pos_usize() {
+        return abs_index(i, len);
+    }
+    let f = i.as_f64();
+    if f.is_nan() || f.abs() >= 2147483648.0 {
+        return None;
+    }
+    #[allow(clippy::cast_possible_truncation)]
+    let i = f as isize;
+    abs_index(num::PosUsize(i >= 0, i.unsigned_abs()), len)
 }
 
 /// Order-preserving map
@@ -392,6 +443,10 @@ impl jaq_std::ValT for Val {
     fn from_utf8_bytes(b: impl AsRef<[u8]> + Send + 'static) -> Self {
         Self::utf8_str(Bytes::from_owner(b))
     }
+
+    fn type_error(&self, message: &str) -> Error {
+        type_error(self, message)
+    }
 }
 
 /// Definitions of the standard library.
@@ -531,14 +586,10 @@ impl Val {
     fn index_opt(self, index: &Self) -> Result<Option<Val>, Error> {
         Ok(match (self, index) {
             (Val::Null, _) => None,
-            (Val::BStr(a), Val::Num(i @ (Num::Int(_) | Num::BigInt(_)))) => i
-                .as_pos_usize()
-                .and_then(|i| abs_index(i, a.len()))
-                .map(|i| usize::from(a[i]).into()),
-            (Val::Arr(a), Val::Num(i @ (Num::Int(_) | Num::BigInt(_)))) => i
-                .as_pos_usize()
-                .and_then(|i| abs_index(i, a.len()))
-                .map(|i| a[i].clone()),
+            (Val::BStr(a), Val::Num(i)) => {
+                jq_array_index(i, a.len()).map(|i| usize::from(a[i]).into())
+            }
+            (Val::Arr(a), Val::Num(i)) => jq_array_index(i, a.len()).map(|i| a[i].clone()),
             (Val::Arr(_), Val::Arr(y)) if y.is_empty() => Some(Val::Arr(Default::default())),
             (Val::Arr(x), Val::Arr(y)) => {
                 // adapted from the implementation of the `indices` filter
@@ -560,7 +611,7 @@ impl Val {
                 let end = o.get(&Val::utf8_str("end"));
                 return v.range(start..end).map(Some);
             }
-            (s, _) => return Err(Error::index(s, index.clone())),
+            (s, _) => return Err(index_type_error(&s, index)),
         })
     }
 }
@@ -772,7 +823,9 @@ impl core::ops::Rem for Val {
     type Output = ValR;
     fn rem(self, rhs: Self) -> Self::Output {
         match (self, rhs) {
-            (Self::Num(x), Self::Num(y)) if y == Num::Int(0) => Err(zero_divisor_error(x, y, true)),
+            (Self::Num(x), Self::Num(y)) if y.is_zero_divisor() && !x.as_f64().is_nan() => {
+                Err(zero_divisor_error(x, y, true))
+            }
             (Self::Num(x), Self::Num(y)) => Ok(Self::Num(x % y)),
             (l, r) => Err(Error::math(l, ops::Math::Rem, r)),
         }

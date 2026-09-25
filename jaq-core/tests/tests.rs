@@ -255,12 +255,12 @@ yields!(
 yields!(
     try_catch_short_circuit,
     r#"[try ("1", "2", []["3"], "4") catch .]"#,
-    ["1", "2", r#"cannot index [] with "3""#]
+    ["1", "2", r#"Cannot index array with string ("3")"#]
 );
 yields!(
     try_catch_nested,
     r#"try try []["a"] catch []["b"] catch ."#,
-    r#"cannot index [] with "b""#
+    r#"Cannot index array with string ("b")"#
 );
 yields!(
     try_catch_multi_valued,

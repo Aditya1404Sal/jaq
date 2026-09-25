@@ -150,6 +150,11 @@ pub trait ValT: jaq_core::ValT + Ord + From<f64> + From<usize> {
 
     /// Interpret bytes as UTF-8 string value.
     fn from_utf8_bytes(b: impl AsRef<[u8]> + Send + 'static) -> Self;
+
+    /// An error about this value, as jq's `type_error` words it: `TYPE (VALUE) MESSAGE`.
+    fn type_error(&self, message: &str) -> Error<Self> {
+        Error::str(format_args!("{self} {message}"))
+    }
 }
 
 /// Convenience trait for implementing the core functions.
@@ -189,22 +194,20 @@ trait ValTx: ValT + Sized {
         Ok(Self::from_iter(a))
     }
 
+    /// Round as jq does, on doubles: the result is an integer while a double holds it exactly
+    /// (2^53) and it fits `isize`; past that it stays a double (`1e30 | floor` is `1e+30`), as
+    /// does a negative zero (`-0.4 | round` is `-0`).
     fn round(self, f: impl FnOnce(f64) -> f64) -> ValR<Self> {
-        Ok(if self.is_int() {
-            self
+        const EXACT: f64 = 9007199254740992.0;
+        let f = f(self.try_as_f64()?);
+        let int = f.abs() <= EXACT
+            && isize::MIN as f64 <= f
+            && f <= isize::MAX as f64
+            && !(f == 0.0 && f.is_sign_negative());
+        Ok(if int {
+            Self::from(f as isize)
         } else {
-            let f = f(self.try_as_f64()?);
-            if f.is_finite() {
-                if isize::MIN as f64 <= f && f <= isize::MAX as f64 {
-                    Self::from(f as isize)
-                } else {
-                    // print floating-point number without decimal places,
-                    // i.e. like an integer
-                    Self::from_num(&alloc::format!("{f:.0}"))?
-                }
-            } else {
-                Self::from(f)
-            }
+            Self::from(f)
         })
     }
 
@@ -349,22 +352,30 @@ impl Iterator for Explode<'_> {
     }
 }
 
-/// Convert an array of Unicode codepoints (with negative integers representing UTF-8 errors) into a string.
-fn implode<V: ValT>(xs: &[V]) -> Result<Vec<u8>, Error<V>> {
-    let mut v = Vec::with_capacity(xs.len());
+/// Convert an array of Unicode codepoints into a string, as jq 1.8 does: each number is
+/// truncated to an integer (C's `(int)`), and one that is not a Unicode scalar value becomes
+/// U+FFFD.
+fn implode<V: ValT>(v: V) -> Result<Vec<u8>, Error<V>> {
+    let xs: Vec<V> = v
+        .into_seq()
+        .map_err(|_| Error::str("implode input must be an array"))?;
+    let mut s = String::with_capacity(xs.len());
     for x in xs {
-        // on 32-bit systems, some high u32 values cannot be represented as isize
-        let i = x.try_as_isize()?;
-        if let Ok(b) = u8::try_from(-i) {
-            v.push(b)
+        let message = "can't be imploded, unicode codepoint needs to be numeric";
+        let f = x.as_f64().filter(|f| !f.is_nan());
+        let f = f.ok_or_else(|| x.type_error(message))?;
+        // C leaves a conversion out of `int`'s range undefined; x86-64 yields INT_MIN and
+        // AArch64 saturates, and jq replaces either.
+        #[allow(clippy::cast_possible_truncation)]
+        let i = if (-2147483648.0..2147483648.0).contains(&f) {
+            f as i64
         } else {
-            // may fail e.g. on `[1114112] | implode`
-            let c = u32::try_from(i).ok().and_then(char::from_u32);
-            let c = c.ok_or_else(|| Error::str(format_args!("cannot use {i} as character")))?;
-            v.extend(c.encode_utf8(&mut [0; 4]).as_bytes())
-        }
+            -1
+        };
+        let c = u32::try_from(i).ok().and_then(char::from_u32);
+        s.push(c.unwrap_or('\u{FFFD}'));
     }
-    Ok(v)
+    Ok(s.into_bytes())
 }
 
 fn once_or_empty<'a, T: 'a, E: 'a>(r: Result<Option<T>, E>) -> BoxIter<'a, Result<T, E>> {
@@ -499,8 +510,7 @@ where
             bome(cv.1.try_as_utf8_bytes().and_then(|s| explode(s).collect()))
         }),
         ("implode", v(0), |cv| {
-            let implode = |s: Vec<_>| implode(&s);
-            bome(cv.1.into_vec().and_then(implode).map(D::V::from_utf8_bytes))
+            bome(implode(cv.1).map(D::V::from_utf8_bytes))
         }),
         ("ascii_downcase", v(0), |cv| {
             bome(cv.1.map_utf8_str(ByteSlice::to_ascii_lowercase))

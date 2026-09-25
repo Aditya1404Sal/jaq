@@ -78,7 +78,12 @@ fn explode_implode() {
     give(json!("y̆"), "explode | implode", json!("y̆"));
 }
 
-yields!(implode_invalid, "[1114112] | try implode catch -1", -1);
+// jq replaces a number that is not a Unicode scalar value with U+FFFD
+yields!(
+    implode_invalid,
+    "[1114112, 55296, -1] | implode",
+    "\u{FFFD}\u{FFFD}\u{FFFD}"
+);
 
 yields!(
     encode_base64,
@@ -196,11 +201,7 @@ yields!(ceili_floor, "-1.4 | ceil ", -1);
 
 yields!(round_nan, "nan | round | isnan", true);
 yields!(round_inf, "infinite | round | isinfinite", true);
-yields!(
-    round_large,
-    "2e22 | round | tostring",
-    "20000000000000000000000"
-);
+yields!(round_large, "2e22 | round | tostring", "2e+22");
 
 yields!(
     sort_break_out,

@@ -158,10 +158,11 @@ fn range_update() {
         json!([0, 5, 6, 5, 6, 1, 2]),
     );
 
+    // as in jq, an integral double such as `3.0` ends a slice like `3`
     give(
         json!([0, 1, 2]),
         ".[:2,3.0]? |= [.[] | .+1]",
-        json!([1, 2, 2]),
+        json!([2, 3, 3]),
     );
 }
 

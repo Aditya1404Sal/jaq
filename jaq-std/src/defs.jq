@@ -131,3 +131,14 @@ def @uri    : tostring | encode_uri;
 def @urid   : tostring | decode_uri;
 def @base64 : tostring | encode_base64;
 def @base64d: tostring | decode_base64;
+
+# jq's SQL-style operators
+def INDEX(stream; idx_expr): reduce stream as $row ({}; .[$row | idx_expr | tostring] = $row);
+def INDEX(idx_expr): INDEX(.[]; idx_expr);
+def JOIN($idx; idx_expr): [.[] | [., $idx[idx_expr]]];
+def JOIN($idx; stream; idx_expr): stream | [., $idx[idx_expr]];
+def JOIN($idx; stream; idx_expr; join_expr): stream | [., $idx[idx_expr]] | join_expr;
+def IN(s): any(s == .; .);
+def IN(src; s): any(src == s; .);
+
+def trimstr($val): ltrimstr($val) | rtrimstr($val);
