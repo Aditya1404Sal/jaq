@@ -59,7 +59,14 @@ fn range<V: ValT>(mut from: ValX<V>, to: V, by: V) -> impl Iterator<Item = ValX<
         Ok(x) => match cmp {
             Greater => x < to,
             Less => x > to,
-            Equal => x != to,
+            // FA-070: a zero step never advances `from`, so looping on `x != to` (as the
+            // idealized `while` definition above literally says) never terminates whenever
+            // `from != to` — this used to hang the whole tool. jq's own native range doesn't
+            // symbolically expand that `while` at all here; it special-cases a zero step to
+            // produce nothing, matching neither the "loop forever" nor "loop once" reading
+            // (verified against the oracle: `range(0;10;0)` yields the empty stream, not an
+            // infinite one stuck at `from`, and not a single `0` either).
+            Equal => false,
         }
         .then(|| core::mem::replace(&mut from, (x + by.clone()).map_err(Exn::from))),
         e @ Err(_) => {

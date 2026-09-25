@@ -71,9 +71,12 @@ yields!(range_fp, "[range(0.0; 2; 0.5)]", [0.0, 0.5, 1.0, 1.5]);
 // number parsing would give `1e1000` for free, overflowing to +-infinity.
 yields!(range_ip, "[limit(3; range(0; 1e1000; 1))]", [0, 1, 2]);
 yields!(range_in, "[limit(3; range(0; -1e1000; -1))]", [0, -1, -2]);
-// here, we diverge from jq, which just returns the empty list
-yields!(range_pz, "[limit(3; range(0; 6; 0))]", json!([0, 0, 0]));
-yields!(range_nz, "[limit(3; range(0; -6; 0))]", json!([0, 0, 0]));
+// FA-070: this used to diverge from jq (which yields the empty list) by looping on `from`
+// forever whenever `from != to` — `limit` cut that infinite stream short here, but an
+// unlimited `range(0;6;0)` on its own hung indefinitely (a real production trap: see FA-070).
+// jq's own real behavior is matched now instead of jaq's own (former) divergence.
+yields!(range_pz, "[limit(3; range(0; 6; 0))]", json!([]));
+yields!(range_nz, "[limit(3; range(0; -6; 0))]", json!([]));
 
 yields!(
     path_value,
