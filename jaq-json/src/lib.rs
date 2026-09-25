@@ -673,11 +673,15 @@ fn obj_merge(l: &mut Rc<Map>, r: Rc<Map>) {
 
 /// jq caps a repeated string's result length at `INT_MAX` (its `jv` string length field is a
 /// signed 32-bit int internally, even on a 64-bit host) and refuses to even attempt building a
-/// longer one, rather than let the allocation run — which, unlike jq's own native process, this
-/// tool cannot recover from: a WASI allocation failure aborts the whole component. Verified
-/// against the oracle: `"a" * 1500000000` (a sub-`INT_MAX` result) succeeds, `"a" * 2147483647`
-/// (`INT_MAX` exactly) and `"a" * 4294967296` do not.
-const MAX_REPEATED_STRING_LEN: usize = i32::MAX as usize;
+/// longer one, rather than let the allocation run. A real process can often still satisfy an
+/// allocation that large (jq's own oracle-verified boundary: `"a" * 1500000000` succeeds,
+/// `"a" * 2147483647` — `INT_MAX` exactly — does not); the sandbox this tool actually runs in
+/// cannot — attempting even the `INT_MAX`-byte case (still under jq's own cap) aborts the whole
+/// component with an allocation failure, unlike jq's own recoverable error. Capped well below
+/// that instead, at the same order of magnitude this tool already uses elsewhere for a
+/// platform-imposed (not jq-imposed) ceiling — e.g. grep's `-f -`/stdin read limit — since jq's
+/// own `INT_MAX` bound is not actually reachable here.
+const MAX_REPEATED_STRING_LEN: usize = 16 * 1024 * 1024;
 
 fn checked_repeat_len(part_len: usize, count: isize) -> Result<usize, Error> {
     part_len
