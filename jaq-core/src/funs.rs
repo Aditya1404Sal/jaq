@@ -126,10 +126,16 @@ macro_rules! while_gtz {
 /// However, this does not allow `path(limit(...))`, because
 /// `limit` binds the outputs of `f` to a variable (`$x`).
 /// Variables never have a path in jaq, whereas they may in jq.
+///
+/// Like jq, both fail for a count below 0 (or one that is not a number and not above 0).
 macro_rules! limit {
     ( $run:ident ) => {
         |mut cv| {
             let ((f, fc), n) = (cv.0.pop_fun(), cv.0.pop_var());
+            if n < 0.into() {
+                let error = Error::str("limit doesn't support negative count");
+                return Box::new(core::iter::once(Err(Exn::from(error))));
+            }
             if n <= 0.into() {
                 return Box::new(core::iter::empty());
             }
@@ -142,6 +148,10 @@ macro_rules! skip {
     ( $run:ident ) => {
         |mut cv| {
             let ((f, fc), n) = (cv.0.pop_fun(), cv.0.pop_var());
+            if n < 0.into() {
+                let error = Error::str("skip doesn't support negative count");
+                return Box::new(core::iter::once(Err(Exn::from(error))));
+            }
             let mut iter = f.$run((fc, cv.1));
             if n <= 0.into() {
                 return iter;

@@ -56,6 +56,7 @@ mod filter;
 mod fold;
 mod funs;
 mod into_iter;
+pub mod jq_utf8;
 pub mod load;
 pub mod native;
 pub mod ops;

@@ -135,6 +135,8 @@ pub enum Pattern<S> {
     Arr(Vec<Self>),
     /// Object
     Obj(Vec<(Term<S>, Self)>),
+    /// Destructuring alternatives, `p1 ?// p2 ?// ...`, as the whole pattern of `... as`
+    Alt(Vec<Self>),
 }
 
 /// Binary operators, such as `|`, `,`, `//`, ...
@@ -210,6 +212,7 @@ impl<S> Pattern<S> {
             Pattern::Var(x) => Box::new(core::iter::once(x)),
             Pattern::Arr(a) => Box::new(a.iter().flat_map(|p| p.vars())),
             Pattern::Obj(o) => Box::new(o.iter().flat_map(|(_k, p)| p.vars())),
+            Pattern::Alt(ps) => Box::new(ps.iter().flat_map(|p| p.vars())),
         }
     }
 }
@@ -359,8 +362,17 @@ impl<'s, 't> Parser<'s, 't> {
                 "|" => BinaryOp::Pipe(None),
                 "as" => {
                     let x = p.pattern()?;
+                    let mut alts = Vec::new();
+                    while p.destructuring_alt() {
+                        alts.push(p.pattern()?);
+                    }
                     p.just("|")?;
-                    BinaryOp::Pipe(Some(x))
+                    if alts.is_empty() {
+                        BinaryOp::Pipe(Some(x))
+                    } else {
+                        alts.insert(0, x);
+                        BinaryOp::Pipe(Some(Pattern::Alt(alts)))
+                    }
                 }
                 "," if with_comma => BinaryOp::Comma,
                 "+" => BinaryOp::Math(Math::Add),
@@ -424,6 +436,22 @@ impl<'s, 't> Parser<'s, 't> {
         match self.i.next() {
             Some(Token(s, _)) if *s == c => Ok(*s),
             next => Err((Expect::Just(c), next)),
+        }
+    }
+
+    /// Consume jq's `?//` (one token in jq, `?` then `//` here), if it comes next.
+    fn destructuring_alt(&mut self) -> bool {
+        let mut i = self.i.clone();
+        match (i.next(), i.next()) {
+            (Some(Token(q, Tok::Sym)), Some(Token(alt, Tok::Sym)))
+                if *q == "?"
+                    && *alt == "//"
+                    && q.as_ptr() as usize + 1 == alt.as_ptr() as usize =>
+            {
+                self.i = i;
+                true
+            }
+            _ => false,
         }
     }
 

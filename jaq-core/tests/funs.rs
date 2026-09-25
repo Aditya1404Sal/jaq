@@ -48,8 +48,17 @@ fn limit() {
     gives(json!(null), "limit(0; 1,2)", []);
     give(json!(null), "[limit(1, 0, 3; 0, 1)]", json!([0, 0, 1]));
 
-    // here, jaq diverges from jq, which returns `[0, 1]`
-    give(json!(null), "[limit(-1; 0, 1)]", json!([]));
+    // jq 1.8 refuses a negative count
+    give(
+        json!(null),
+        "try limit(-1; 0, 1) catch .",
+        json!("limit doesn't support negative count"),
+    );
+    give(
+        json!(null),
+        "try skip(-1; 0, 1) catch .",
+        json!("skip doesn't support negative count"),
+    );
 }
 
 yields!(limit_overflow, "[limit(0; def f: f | .; f)]", json!([]));

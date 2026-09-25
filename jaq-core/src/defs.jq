@@ -60,7 +60,7 @@ def join($s): .[] |= tostring | .[:-1][] += $s | reduce .[] as $x (""; . + $x);
 def combinations: .[][] |= [.] | reduce .[] as $a ([]; . + $a[]);
 def combinations($n): [limit($n; repeat(.))] | combinations;
 
-def nth(n; g): first(skip(n; g));
+def nth($n; g): if $n < 0 then error("nth doesn't support negative indices") else first(skip($n; g)) end;
 
 # Objects <-> Arrays
 def   to_entries: [key_values[] as [$key, $value] | { $key, $value }];

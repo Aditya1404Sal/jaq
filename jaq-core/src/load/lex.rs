@@ -67,6 +67,8 @@ pub enum Expect<S> {
     Unicode,
     /// `&`, `§`, `💣`
     Token,
+    /// `"\ud800"`: a run of string escapes that jq's JSON reader rejects, with its message
+    JqEscape(alloc::string::String),
 }
 
 impl Expect<&str> {
@@ -83,6 +85,15 @@ impl Expect<&str> {
             Self::Escape => "string escape sequence",
             Self::Unicode => "4-digit hexadecimal UTF-8 code point",
             Self::Token => "token",
+            Self::JqEscape(_) => "valid string escape sequences",
+        }
+    }
+
+    /// The complete message for an error that has one of its own (jq's wording).
+    pub fn message(&self) -> Option<&str> {
+        match self {
+            Self::JqEscape(message) => Some(message),
+            _ => None,
         }
     }
 }
@@ -204,12 +215,12 @@ impl<'a> Lexer<&'a str> {
         }
     }
 
-    /// Decimal with optional exponent.
+    /// Decimal with optional exponent, in jq's shapes: `1`, `1.`, `1.5` and `.5`.
     fn num(&mut self) {
         self.trim(|c| c.is_ascii_digit());
         if let Some(i) = self.i.strip_prefix('.') {
             self.i = i;
-            self.digits1();
+            self.trim(|c| c.is_ascii_digit());
         }
         if let Some(i) = self.i.strip_prefix(['e', 'E']) {
             self.i = i.strip_prefix(['+', '-']).unwrap_or(i);
@@ -261,6 +272,39 @@ impl<'a> Lexer<&'a str> {
         Some(part)
     }
 
+    /// A run of escapes, read as jq's lexer does: `\` then any character but `u` or `(`, or
+    /// `\u` then up to four letters or digits, repeated. jq hands the run to its JSON reader as
+    /// one string, so a surrogate pair may span two escapes and a bad run fails with the
+    /// reader's message. The input has to start with a backslash that is not `\(`.
+    fn escapes(&mut self, parts: &mut Vec<StrPart<&'a str, Token<&'a str>>>) {
+        let start = self.i;
+        let mut rest = start;
+        while let Some(after) = rest.strip_prefix('\\') {
+            let mut chars = after.chars();
+            match chars.next() {
+                None | Some('(') => break,
+                Some('u') => {
+                    let hex = chars.as_str();
+                    let len = hex.bytes().take(4).take_while(u8::is_ascii_alphanumeric);
+                    rest = &hex[len.count()..];
+                }
+                Some(_) => rest = chars.as_str(),
+            }
+        }
+        let run = &start[..start.len() - rest.len()];
+        if run.is_empty() {
+            // a backslash that ends the program
+            self.i = &start[1..];
+            self.e.push((Expect::Escape, self.i));
+            return;
+        }
+        self.i = rest;
+        match jq_escapes(run) {
+            Ok(text) => parts.extend(text.chars().map(StrPart::Char)),
+            Err(message) => self.e.push((Expect::JqEscape(message), run)),
+        }
+    }
+
     /// Lex a (possibly interpolated) string.
     ///
     /// The input string has to start with '"'.
@@ -273,6 +317,10 @@ impl<'a> Lexer<&'a str> {
             let s = self.consumed(0, |lex| lex.trim(|c| c != '\\' && c != '"'));
             if !s.is_empty() {
                 parts.push(StrPart::Str(s));
+            }
+            if self.i.starts_with('\\') && !self.i.starts_with("\\(") {
+                self.escapes(&mut parts);
+                continue;
             }
             match self.next() {
                 Some('"') => break,
@@ -302,6 +350,7 @@ impl<'a> Lexer<&'a str> {
             '0'..='9' => (self.consumed(1, Self::num), Tok::Num),
             c if hd_op(c) => (self.consumed(1, |lex| lex.trim(tl_op)), Tok::Sym),
             '.' => match chars.next() {
+                Some('0'..='9') => (self.consumed(0, Self::num), Tok::Num),
                 Some('.') => (self.take(2), Tok::Sym),
                 Some('a'..='z' | 'A'..='Z' | '_') => (self.consumed(2, Self::ident0), Tok::Sym),
                 _ => (self.take(1), Tok::Sym),
@@ -340,6 +389,78 @@ impl<'a> Lexer<&'a str> {
         }
         Tok::Block(tokens)
     }
+}
+
+/// Decode a run of string escapes as jq's JSON reader does (`found_string` in `jv_parse.c`,
+/// reached through `jv_parse_sized` on the run in quotes), or fail with jq's message.
+fn jq_escapes(run: &str) -> Result<alloc::string::String, alloc::string::String> {
+    let bytes = run.as_bytes();
+    let fail = |message: &str| {
+        // jq reports the position of the closing quote it put after the run.
+        let line = 1 + bytes.iter().filter(|b| **b == b'\n').count();
+        let column = match bytes.iter().rposition(|b| *b == b'\n') {
+            Some(newline) => bytes.len() - newline,
+            None => bytes.len() + 2,
+        };
+        alloc::format!("{message} at line {line}, column {column} (while parsing '\"{run}\"')")
+    };
+    let hex4 = |hex: &[u8]| -> Option<u32> {
+        let text = core::str::from_utf8(hex).ok()?;
+        text.bytes()
+            .all(|b| b.is_ascii_hexdigit())
+            .then(|| u32::from_str_radix(text, 16).ok())
+            .flatten()
+    };
+    let mut out = Vec::new();
+    let mut i = 0;
+    while i < bytes.len() {
+        let c = bytes[i];
+        i += 1;
+        if c != b'\\' {
+            if c < 0x20 {
+                let message =
+                    "Invalid string: control characters from U+0000 through U+001F must be escaped";
+                return Err(fail(message));
+            }
+            out.push(c);
+            continue;
+        }
+        let Some(&c) = bytes.get(i) else {
+            return Err(fail("Expected escape character at end of string"));
+        };
+        i += 1;
+        match c {
+            b'\\' | b'"' | b'/' => out.push(c),
+            b'b' => out.push(b'\x08'),
+            b'f' => out.push(b'\x0C'),
+            b't' => out.push(b'\t'),
+            b'n' => out.push(b'\n'),
+            b'r' => out.push(b'\r'),
+            b'u' => {
+                let Some(hex) = bytes.get(i..i + 4) else {
+                    return Err(fail("Invalid \\uXXXX escape"));
+                };
+                let Some(mut codepoint) = hex4(hex) else {
+                    return Err(fail("Invalid characters in \\uXXXX escape"));
+                };
+                i += 4;
+                if (0xD800..=0xDBFF).contains(&codepoint) {
+                    let low = match bytes.get(i..i + 6) {
+                        Some([b'\\', b'u', hex @ ..]) => hex4(hex),
+                        _ => None,
+                    };
+                    let Some(low) = low.filter(|low| (0xDC00..=0xDFFF).contains(low)) else {
+                        return Err(fail("Invalid \\uXXXX\\uXXXX surrogate pair escape"));
+                    };
+                    i += 6;
+                    codepoint = 0x10000 + (((codepoint - 0xD800) << 10) | (low - 0xDC00));
+                }
+                crate::jq_utf8::encode(codepoint, &mut out);
+            }
+            _ => return Err(fail("Invalid escape")),
+        }
+    }
+    Ok(crate::jq_utf8::lossy(out))
 }
 
 impl<'a> Token<&'a str> {

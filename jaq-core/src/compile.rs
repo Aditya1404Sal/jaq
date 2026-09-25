@@ -696,6 +696,9 @@ impl<'s, F> Compiler<&'s str, F> {
                     _ => self.fail(name, Undefined::Filter(arity)),
                 }
             }
+            BinOp(l, parse::BinaryOp::Pipe(Some(parse::Pattern::Alt(alts))), r) => {
+                return self.term(destructure_alts(*l, alts, *r), tr);
+            }
             BinOp(l, op, r) => {
                 use parse::BinaryOp::*;
                 let (l, (r, tr_)) = match op {
@@ -784,6 +787,11 @@ impl<'s, F> Compiler<&'s str, F> {
                 let iter = o.into_iter().map(|(k, p)| (self.iterm(k), self.pattern(p)));
                 Pattern::Idx(iter.collect())
             }
+            // `term` rewrites `?//` before its patterns get here.
+            parse::Pattern::Alt(alts) => match alts.into_iter().next() {
+                Some(first) => self.pattern(first),
+                None => Pattern::Var,
+            },
         }
     }
 
@@ -986,4 +994,46 @@ fn tco() {
       f          # main -> { } (f is called with CatchOne)
     "#;
     assert_eq!(*calls_in(f), [CatchOne, CatchAll, Throw]);
+}
+
+/// jq's destructuring alternatives: `l as p1 ?// p2 ?// ... ?// pn | r` binds each value of `l`
+/// to `p1` and runs `r`; if that fails (binding or `r`), it tries the next pattern, and the last
+/// one's error is the result. Every variable of every pattern is bound, to `null` where the
+/// pattern in use does not name it. As a term:
+///
+/// ~~~ text
+/// l as $?// | try ($?// as p1 | r1) catch try ($?// as p2 | r2) catch ... ($?// as pn | rn)
+/// ~~~
+///
+/// where `ri` is `r` behind `null as $x |` for each variable `$x` that `pi` lacks.
+fn destructure_alts<'s>(
+    l: parse::Term<&'s str>,
+    alts: Vec<parse::Pattern<&'s str>>,
+    r: parse::Term<&'s str>,
+) -> parse::Term<&'s str> {
+    use parse::{BinaryOp, Pattern, Term};
+    const VALUE: &str = "$?//";
+    let mut vars: Vec<&str> = Vec::new();
+    for x in alts.iter().flat_map(Pattern::vars) {
+        if !vars.contains(x) {
+            vars.push(x);
+        }
+    }
+    let bind = |t: Term<&'s str>, pat: Pattern<&'s str>, body: Term<&'s str>| {
+        Term::BinOp(Box::new(t), BinaryOp::Pipe(Some(pat)), Box::new(body))
+    };
+    let branch = |pat: Pattern<&'s str>| {
+        let own: Vec<&str> = pat.vars().copied().collect();
+        let missing = vars.iter().rev().filter(|x| !own.contains(x));
+        let body = missing.fold(r.clone(), |body, x| {
+            bind(Term::Call("null", Vec::new()), Pattern::Var(x), body)
+        });
+        bind(Term::Var(VALUE), pat, body)
+    };
+    let mut alts = alts.into_iter().rev();
+    let last = alts.next().map_or_else(|| r.clone(), branch);
+    let chain = alts.fold(last, |catch, pat| {
+        Term::TryCatch(Box::new(branch(pat)), Some(Box::new(catch)))
+    });
+    bind(l, Pattern::Var(VALUE), chain)
 }
