@@ -113,6 +113,32 @@ impl Type {
     }
 }
 
+/// A value's own jq type name (`type`'s own vocabulary: `null`/`boolean`/`number`/`string`/
+/// `array`/`object`), as opposed to [`Type`] above, which names a *target* type a value failed
+/// to convert to.
+fn type_name(v: &Val) -> &'static str {
+    match v {
+        Val::Null => "null",
+        Val::Bool(_) => "boolean",
+        Val::Num(_) => "number",
+        Val::BStr(_) | Val::TStr(_) => "string",
+        Val::Arr(_) => "array",
+        Val::Obj(_) => "object",
+    }
+}
+
+/// jq's own wording for indexing a container by a key of the wrong type — e.g. `{}[0]` or
+/// `[][{}]` — is `Cannot index TYPE1 with TYPE2 (VALUE)`, always including the index's own
+/// (compact-JSON) value, for every index type. Verified against the oracle for a number,
+/// boolean, null, array and object index into an object.
+fn index_type_error(container: &Val, index: &Val) -> Error {
+    Error::str(format_args!(
+        "Cannot index {} with {} ({index})",
+        type_name(container),
+        type_name(index)
+    ))
+}
+
 /// Order-preserving map
 pub type Map<K = Val, V = K> = indexmap::IndexMap<K, V, foldhash::fast::RandomState>;
 
@@ -520,10 +546,14 @@ impl Val {
                 let indices = iw.filter_map(|(i, w)| (w == **y).then_some(i));
                 Some(indices.map(Val::from).collect())
             }
-            // NB: jaq deliberately diverges from jq here (see jaq-core's own
-            // `path::index_access` test) — jaq objects can hold non-string keys, so
-            // indexing one by e.g. an integer is a (miss -> null), not a type error.
-            (Val::Obj(o), i) => o.get(i).cloned(),
+            // jq only ever indexes an object by a string key; a non-string index (`{}[0]`) is a
+            // type error there, not a (guaranteed) miss that quietly reads as `null` — even
+            // though jaq objects can technically hold non-string keys (from `{(0): 1}`-style
+            // construction). This build follows jq's behavior rather than jaq's own, since jq's
+            // behavior is the bar the tool is advertised against; see `index_type_error`'s doc
+            // comment for the exact wording, verified against the oracle for every index type.
+            (Val::Obj(o), i @ (Val::TStr(_) | Val::BStr(_))) => o.get(i).cloned(),
+            (s @ Val::Obj(_), i) => return Err(index_type_error(&s, i)),
             (v @ (Val::BStr(_) | Val::TStr(_) | Val::Arr(_)), Val::Obj(o)) => {
                 use jaq_core::ValT;
                 let start = o.get(&Val::utf8_str("start"));
@@ -684,6 +714,17 @@ fn split<'a>(s: &'a [u8], sep: &'a [u8]) -> Box<dyn Iterator<Item = &'a [u8]> + 
     }
 }
 
+/// jq's own wording for `X / 0` or `X % 0` (of any number type, not just integer zero — a float
+/// `0.0` divisor is just as refused): `number (X) and number (Y) cannot be divided[ (remainder)]
+/// because the divisor is zero`. Verified against the oracle for `/` and `%`, integer and float
+/// zero divisors alike.
+fn zero_divisor_error(x: Num, y: Num, remainder: bool) -> Error {
+    let what = if remainder { " (remainder)" } else { "" };
+    Error::str(format_args!(
+        "number ({x}) and number ({y}) cannot be divided{what} because the divisor is zero"
+    ))
+}
+
 impl core::ops::Div for Val {
     type Output = ValR;
     fn div(self, rhs: Self) -> Self::Output {
@@ -691,11 +732,13 @@ impl core::ops::Div for Val {
             split(&x, &y).map(|s| into(x.slice_ref(s))).collect()
         };
         match (self, rhs) {
-            // NB: unlike jq, jaq deliberately lets division by zero through to the
-            // underlying IEEE result (+-infinity, or NaN for 0/0) rather than erroring —
-            // jaq-std's own `nan`/`infinite` are defined in terms of it (see
-            // jaq-std/src/defs.jq), and jaq-core/jaq-json's own tests (`range_ip`,
-            // `range_in`, `tojson_nan`, `tojson_inf`, `tojson_ninf`) require it.
+            // jq refuses division by an exact-zero divisor (integer or float) rather than let it
+            // through to the underlying IEEE result — matching jq's own behavior is the bar this
+            // build follows, even where jaq's own upstream deliberately lets it through (jaq-std's
+            // `nan`/`infinite` no longer rely on this; see jaq-std/src/lib.rs).
+            (Self::Num(x), Self::Num(y)) if y == Num::Int(0) => {
+                Err(zero_divisor_error(x, y, false))
+            }
             (Self::Num(x), Self::Num(y)) => Ok(Self::Num(x / y)),
             (Self::TStr(x), Self::TStr(y)) => Ok(fs(*x, *y, Val::utf8_str)),
             (Self::BStr(x), Self::BStr(y)) => Ok(fs(*x, *y, Val::byte_str)),
@@ -708,9 +751,8 @@ impl core::ops::Rem for Val {
     type Output = ValR;
     fn rem(self, rhs: Self) -> Self::Output {
         match (self, rhs) {
-            (Self::Num(x), Self::Num(y)) if !(x.is_int() && y.is_int() && y == Num::Int(0)) => {
-                Ok(Self::Num(x % y))
-            }
+            (Self::Num(x), Self::Num(y)) if y == Num::Int(0) => Err(zero_divisor_error(x, y, true)),
+            (Self::Num(x), Self::Num(y)) => Ok(Self::Num(x % y)),
             (l, r) => Err(Error::math(l, ops::Math::Rem, r)),
         }
     }
