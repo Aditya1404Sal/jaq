@@ -31,12 +31,21 @@ impl core::fmt::Display for Error {
 #[cfg(feature = "std")]
 impl std::error::Error for Error {}
 
+/// How many nested `[`/`{` levels [`parse`] will descend into before refusing with
+/// [`hifijson::Error::Depth`] instead of recursing further. `parse` recurses once per
+/// level with no explicit stack, so unlike jq's own parser (which doesn't), it can
+/// overflow the native call stack on deeply nested input; under WASI that's a trap with
+/// no way to recover. This is comfortably past any JSON a real program would produce
+/// (`jq`'s own default depth limits, e.g. in `jq -f`'s parser, are in the low hundreds),
+/// while staying well inside what the WASI stack can actually hold.
+const MAX_PARSE_DEPTH: usize = 3000;
+
 /// Parse exactly one JSON value.
 pub fn parse_single(slice: &[u8]) -> Result<Val, Error> {
     let offset = |rest: &[u8]| rest.as_ptr() as usize - slice.as_ptr() as usize;
     let mut lexer = SliceLexer::new(slice);
     lexer
-        .exactly_one(ws_tk, parse)
+        .exactly_one(ws_tk, |next, lexer| parse(next, lexer, 0))
         .map_err(|e| Error(offset(lexer.as_slice()), e))
 }
 
@@ -45,7 +54,10 @@ pub fn parse_many(slice: &[u8]) -> impl Iterator<Item = Result<Val, Error>> + '_
     let offset = |rest: &[u8]| rest.as_ptr() as usize - slice.as_ptr() as usize;
     let mut lexer = SliceLexer::new(slice);
     core::iter::from_fn(move || {
-        Some(parse(ws_tk(&mut lexer)?, &mut lexer).map_err(|e| Error(offset(lexer.as_slice()), e)))
+        Some(
+            parse(ws_tk(&mut lexer)?, &mut lexer, 0)
+                .map_err(|e| Error(offset(lexer.as_slice()), e)),
+        )
     })
 }
 
@@ -55,7 +67,7 @@ pub fn read_many<'a>(read: impl io::BufRead + 'a) -> impl Iterator<Item = io::Re
     let invalid_data = |e| io::Error::new(io::ErrorKind::InvalidData, e);
     let mut lexer = hifijson::IterLexer::new(read.bytes());
     core::iter::from_fn(move || {
-        let v = ws_tk(&mut lexer).map(|next| parse(next, &mut lexer).map_err(invalid_data));
+        let v = ws_tk(&mut lexer).map(|next| parse(next, &mut lexer, 0).map_err(invalid_data));
         // always return I/O error if present, regardless of the output value!
         lexer.error.take().map(Err).or(v)
     })
@@ -116,7 +128,11 @@ fn parse_num<L: LexAlloc>(lexer: &mut L) -> Result<Num, hifijson::Error> {
 /// If the underlying lexer reads input fallibly (for example [`hifijson::IterLexer`]),
 /// the error returned by this function might be misleading.
 /// In that case, always check whether the lexer contains an error.
-fn parse<L: LexAlloc>(next: u8, lexer: &mut L) -> Result<Val, hifijson::Error> {
+///
+/// `depth` is the array/object nesting already descended into; it refuses with
+/// [`hifijson::Error::Depth`] past [`MAX_PARSE_DEPTH`] instead of recursing further (see
+/// its doc comment for why).
+fn parse<L: LexAlloc>(next: u8, lexer: &mut L, depth: usize) -> Result<Val, hifijson::Error> {
     Ok(match next {
         b'n' if lexer.strip_prefix(b"null") => Val::Null,
         b't' if lexer.strip_prefix(b"true") => Val::Bool(true),
@@ -126,10 +142,11 @@ fn parse<L: LexAlloc>(next: u8, lexer: &mut L) -> Result<Val, hifijson::Error> {
         b'I' if lexer.strip_prefix(b"Infinity") => Val::Num(Num::Float(f64::INFINITY)),
         b'0'..=b'9' | b'+' | b'-' => Val::Num(parse_num(lexer)?),
         b'"' => Val::utf8_str(parse_string(lexer.discarded(), false)?),
+        b'[' | b'{' if depth >= MAX_PARSE_DEPTH => Err(hifijson::Error::Depth)?,
         b'[' => Val::Arr({
             let mut arr = Vec::new();
             lexer.discarded().seq(b']', ws_tk, |next, lexer| {
-                arr.push(parse(next, lexer)?);
+                arr.push(parse(next, lexer, depth + 1)?);
                 Ok::<_, hifijson::Error>(())
             })?;
             arr.into()
@@ -137,9 +154,9 @@ fn parse<L: LexAlloc>(next: u8, lexer: &mut L) -> Result<Val, hifijson::Error> {
         b'{' => Val::obj({
             let mut obj = Map::default();
             lexer.discarded().seq(b'}', ws_tk, |next, lexer| {
-                let key = parse(next, lexer)?;
+                let key = parse(next, lexer, depth + 1)?;
                 lexer.expect(ws_tk, b':').ok_or(Expect::Colon)?;
-                let value = parse(ws_tk(lexer).ok_or(Expect::Value)?, lexer)?;
+                let value = parse(ws_tk(lexer).ok_or(Expect::Value)?, lexer, depth + 1)?;
                 obj.insert(key, value);
                 Ok::<_, hifijson::Error>(())
             })?;

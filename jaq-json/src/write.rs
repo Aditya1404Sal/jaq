@@ -259,6 +259,15 @@ macro_rules! format_val {
     }};
 }
 
+/// How many nested `Arr`/`Obj` levels [`write`], [`write_buf`] and [`format`] will
+/// descend into before refusing rather than recursing further. A `Val` can end up this
+/// deep purely from filter evaluation (`reduce range(100000) as $i (1; [.])` needs no
+/// JSON parsing at all), and each of these three functions recurses once per level with
+/// no explicit stack — under WASI, an unrecoverable trap. Printing costs more native
+/// stack per level than parsing does (it goes through `core::fmt`/`io::Write` as well as
+/// this module's own frame), so this is lower than `read`'s `MAX_PARSE_DEPTH`.
+const MAX_WRITE_DEPTH: usize = 1000;
+
 /// Write a value as JSON, using a custom function for child values.
 #[macro_export]
 macro_rules! write_val {
@@ -300,6 +309,12 @@ macro_rules! write_val {
 /// Choose your poison.
 #[cfg(feature = "std")]
 pub fn write(w: &mut dyn io::Write, pp: &Pp, level: usize, v: &Val) -> io::Result<()> {
+    if level >= MAX_WRITE_DEPTH && matches!(v, Val::Arr(_) | Val::Obj(_)) {
+        return Err(io::Error::new(
+            io::ErrorKind::Other,
+            "value nested too deeply to print",
+        ));
+    }
     write_val!(w, pp, level, v, write)
 }
 
@@ -320,9 +335,15 @@ impl fmt::Write for Buf {
 
 pub(crate) fn write_buf(w: &mut Buf, pp: &Pp, level: usize, v: &Val) -> fmt::Result {
     use core::fmt::Write;
+    if level >= MAX_WRITE_DEPTH && matches!(v, Val::Arr(_) | Val::Obj(_)) {
+        return Err(fmt::Error);
+    }
     write_val!(w, pp, level, v, write_buf)
 }
 
 pub(crate) fn format(w: &mut Formatter, pp: &Pp, level: usize, v: &Val) -> fmt::Result {
+    if level >= MAX_WRITE_DEPTH && matches!(v, Val::Arr(_) | Val::Obj(_)) {
+        return Err(fmt::Error);
+    }
     format_val!(w, pp, level, v, format)
 }
