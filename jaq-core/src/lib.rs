@@ -51,6 +51,7 @@ extern crate std;
 pub mod box_iter;
 pub mod compile;
 pub mod data;
+pub mod depth;
 mod exn;
 mod filter;
 mod fold;

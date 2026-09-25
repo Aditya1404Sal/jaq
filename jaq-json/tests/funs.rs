@@ -444,3 +444,81 @@ yields!(
     "{} | delpaths([[\"a\",0]]) | tojson",
     "{}"
 );
+
+// A value nested far deeper than a native stack could recurse through is compared, contained,
+// merged, written and dropped all the same (a test thread's stack is 2 MiB), and written as jq
+// writes it: what lies deeper than 10,000 levels shows as `<skipped: too deep>`.
+#[test]
+fn deep_values() {
+    let arr = "reduce range(100000) as $i (null; [.])";
+    let obj = "reduce range(100000) as $i (null; {a: .})";
+    give(
+        json!(null),
+        &format!("[{arr}, {arr}] | [.[0] == .[1], .[0] < .[1], (.[0] as $a | $a | contains($a))]"),
+        json!([true, false, true]),
+    );
+    give(
+        json!(null),
+        &format!("{obj} | [. * . | ..] | length"),
+        json!(100001),
+    );
+    give(
+        json!(null),
+        &format!("{arr} | tojson | [length, .[10001:10020]]"),
+        json!([20021, "<skipped: too deep>"]),
+    );
+    give(
+        json!(null),
+        &format!("{arr} | [..] | length"),
+        json!(100001),
+    );
+}
+
+// Long flat chains run without recursing once per element.
+#[test]
+fn long_chains() {
+    let n = 10000;
+    let ones = || core::iter::repeat("1").take(n).collect::<Vec<_>>();
+    give(
+        json!(null),
+        &format!("[{}] | length", ones().join(",")),
+        json!(n),
+    );
+    give(json!(null), &ones().join(" + "), json!(n));
+    give(json!(null), &ones().join(" - "), json!(2 - n as i64));
+    give(json!(null), &vec!["."; n].join(" | "), json!(null));
+    let path = ".a".repeat(n);
+    give(json!({}), &path, json!(null));
+    let binds: String = (0..2000).map(|i| format!("{i} as $x{i} | ")).collect();
+    give(json!(null), &format!("{binds} $x0 + $x1999"), json!(1999));
+    let vars: Vec<_> = (0..3000).map(|i| format!("$a{i}")).collect();
+    let pat = format!("[range(3000)] as [{}] | $a2999", vars.join(", "));
+    give(json!(null), &pat, json!(2999));
+}
+
+// jq runs a binary operator's right operand outermost, a chain's last operand outermost, and an
+// error in the right operand before the left runs; an object's first entry stays outermost.
+#[test]
+fn operand_order() {
+    use common::gives;
+    gives(
+        json!(null),
+        "[(1,2) + (10,20) + (100,200)]",
+        [json!([111, 112, 121, 122, 211, 212, 221, 222])],
+    );
+    give(
+        json!(null),
+        r#"try (error("x") + error("y")) catch ."#,
+        json!("y"),
+    );
+    give(
+        json!(null),
+        r#"[try ((1, error("a")) + (10, 20)) catch .]"#,
+        json!([11, "a"]),
+    );
+    give(
+        json!(null),
+        "[{a: (1,2), b: (3,4)}] | map(.a * 10 + .b)",
+        json!([13, 14, 23, 24]),
+    );
+}

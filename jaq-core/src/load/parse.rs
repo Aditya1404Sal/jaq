@@ -228,13 +228,19 @@ impl<S> Term<S> {
     /// Perform precedence climbing of a term followed by operator-term pairs.
     ///
     /// Ensures that `... as $x | ...` is handled like `... as $x | (...)`.
-    fn climb(self, tail: &mut impl Iterator<Item = (BinaryOp<S>, Self)>) -> Self {
-        let tail = core::iter::from_fn(|| {
-            tail.next().map(|(op, tm)| match op {
-                BinaryOp::Pipe(Some(_)) => (op, tm.climb(tail)),
-                _ => (op, tm),
-            })
-        });
+    fn climb(self, mut tail: Vec<(BinaryOp<S>, Self)>) -> Self {
+        // Fold each binding with everything after it, from the last binding back, so that a
+        // chain of bindings is parsed without recursing once per binding.
+        let mut i = tail.len();
+        while i > 0 {
+            i -= 1;
+            if matches!(tail[i].0, BinaryOp::Pipe(Some(_))) {
+                let rest = tail.split_off(i + 1);
+                if let Some((op, tm)) = tail.pop() {
+                    tail.push((op, prec_climb::climb(tm, rest)));
+                }
+            }
+        }
         prec_climb::climb(self, tail)
     }
 }
@@ -523,7 +529,7 @@ impl<'s, 't> Parser<'s, 't> {
         while let Some(op) = self.op(with_comma)? {
             tail.push((op, self.atom()?))
         }
-        Ok(head.climb(&mut tail.into_iter()))
+        Ok(head.climb(tail))
     }
 
     /// Parse an atomic term.

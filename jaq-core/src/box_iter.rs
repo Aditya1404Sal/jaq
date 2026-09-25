@@ -1,6 +1,6 @@
 //! Boxed iterators.
 
-use alloc::boxed::Box;
+use alloc::{boxed::Box, vec::Vec};
 
 /// A boxed iterator.
 pub type BoxIter<'a, T> = Box<dyn Iterator<Item = T> + 'a>;
@@ -90,6 +90,33 @@ pub fn flat_map_then<'a, T: 'a, U: 'a, E: 'a>(
         Some(ly) => then(ly, r),
         None => Box::new(l.flat_map(move |y| then(y, |y| r(y)))),
     }
+}
+
+/// Depth-first over `levels` levels of states, without recursing once per level.
+///
+/// `first` yields the states of level 0, and `next(k, s)` the states of level `k + 1` that follow
+/// a state `s` of level `k`. The states of the last level are the output, in the order that
+/// `levels - 1` nested [`Iterator::flat_map`]s would yield them. This lets a long chain (of
+/// pipes, arithmetic, path parts, pattern elements) run on a heap-allocated stack of iterators.
+pub fn levels<'a, S: 'a>(
+    first: BoxIter<'a, S>,
+    levels: usize,
+    next: impl Fn(usize, S) -> BoxIter<'a, S> + 'a,
+) -> BoxIter<'a, S> {
+    let mut stack = Vec::from([first]);
+    Box::new(core::iter::from_fn(move || loop {
+        let level = stack.len().checked_sub(1)?;
+        match stack[level].next() {
+            None => {
+                stack.pop();
+            }
+            Some(s) if level + 1 < levels => {
+                let states = next(level, s);
+                stack.push(states);
+            }
+            y => return y,
+        }
+    }))
 }
 
 /// Combination of [`flat_map_with`] and [`then`].

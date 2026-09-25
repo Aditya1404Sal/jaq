@@ -171,7 +171,8 @@ yields!(
 yields!(
     scalb_range,
     "[scalb(-2.5, 0, 2.5; 2, 2.5, 3) * 1000 | round]",
-    [-10000, -14142, -20000, 0, 0, 0, 10000, 14142, 20000]
+    // the exponent outermost, as jq runs `x * pow(2; e)`'s right operand first
+    [-10000, 0, 10000, -14142, 0, 14142, -20000, 0, 20000]
 );
 
 // here we diverge from jq, which returns ["a", "b", "a", "A", "b", "B"]
