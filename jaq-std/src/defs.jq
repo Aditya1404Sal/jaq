@@ -16,8 +16,9 @@ def isarray:   . >= []  and . < {};
 def isobject:  . >= {};
 
 # Numbers
-def nan:      0 / 0;
-def infinite: 1 / 0;
+# `nan`/`infinite` are native filters (jaq-std/src/lib.rs), not jq-level definitions: they used
+# to be `0/0`/`1/0`, but `/` now raises jq's own zero-divisor error instead of letting it through
+# to the IEEE result, so getting an actual NaN/Infinity value needs a real primitive.
 def isnan:      . < nan and nan < .;
 def isinfinite: . == infinite or  . == -infinite;
 def isfinite:   isnumber and (isinfinite | not);

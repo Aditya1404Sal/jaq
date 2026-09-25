@@ -565,6 +565,16 @@ where
             let exit_code = cv.0.pop_var().try_as_i32().map_err(Exn::from);
             box_once(exit_code.and_then(|exit_code| Err(Exn::halt(exit_code))))
         }),
+        // `nan`/`infinite` used to be defined in defs.jq as `0/0`/`1/0`, relying on `/` letting
+        // an exact-zero divisor through to the underlying IEEE result. Now that `/` (and `%`)
+        // raise jq's own "divisor is zero" error instead (matching real jq, see jaq-json's `Val`
+        // `Div`/`Rem` impls), that construction no longer works — these are native constants
+        // instead, exactly as jq's own `nan`/`infinite` ultimately bottom out at literal IEEE
+        // values (jq's builtin.jq reaches them via `1e1000`, which is itself just a spelling of
+        // `f64::INFINITY`). `isnan`/`isinfinite`/`isfinite`/`isnormal` and everything built on
+        // them keep working unchanged, since only how `nan`/`infinite` are *produced* changed.
+        ("nan", v(0), |_| bome(Ok(D::V::from(f64::NAN)))),
+        ("infinite", v(0), |_| bome(Ok(D::V::from(f64::INFINITY)))),
     ])
 }
 
