@@ -520,6 +520,9 @@ impl Val {
                 let indices = iw.filter_map(|(i, w)| (w == **y).then_some(i));
                 Some(indices.map(Val::from).collect())
             }
+            // NB: jaq deliberately diverges from jq here (see jaq-core's own
+            // `path::index_access` test) — jaq objects can hold non-string keys, so
+            // indexing one by e.g. an integer is a (miss -> null), not a type error.
             (Val::Obj(o), i) => o.get(i).cloned(),
             (v @ (Val::BStr(_) | Val::TStr(_) | Val::Arr(_)), Val::Obj(o)) => {
                 use jaq_core::ValT;
@@ -688,6 +691,11 @@ impl core::ops::Div for Val {
             split(&x, &y).map(|s| into(x.slice_ref(s))).collect()
         };
         match (self, rhs) {
+            // NB: unlike jq, jaq deliberately lets division by zero through to the
+            // underlying IEEE result (+-infinity, or NaN for 0/0) rather than erroring —
+            // jaq-std's own `nan`/`infinite` are defined in terms of it (see
+            // jaq-std/src/defs.jq), and jaq-core/jaq-json's own tests (`range_ip`,
+            // `range_in`, `tojson_nan`, `tojson_inf`, `tojson_ninf`) require it.
             (Self::Num(x), Self::Num(y)) => Ok(Self::Num(x / y)),
             (Self::TStr(x), Self::TStr(y)) => Ok(fs(*x, *y, Val::utf8_str)),
             (Self::BStr(x), Self::BStr(y)) => Ok(fs(*x, *y, Val::byte_str)),
