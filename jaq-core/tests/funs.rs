@@ -63,8 +63,14 @@ yields!(range_np, "[range(0; -6; 2)]", json!([]));
 yields!(range_nn, "[range(0; -6; -2)]", [0, -2, -4]);
 yields!(range_zz, "[range(0; 0; 0)]", json!([]));
 yields!(range_fp, "[range(0.0; 2; 0.5)]", [0.0, 0.5, 1.0, 1.5]);
-yields!(range_ip, "[limit(3; range(0; 1/0; 1))]", [0, 1, 2]);
-yields!(range_in, "[limit(3; range(0; -1/0; -1))]", [0, -1, -2]);
+// These used to reach an effectively-unbounded range via `1/0`/`-1/0`, but `/` now raises jq's
+// own "divisor is zero" error on an exact-zero divisor (matching real jq) instead of letting it
+// through to the IEEE result — and jaq-core can't reach jaq-std's `infinite` native from here
+// anyway (jaq-core doesn't depend on jaq-std). `1e1000` is parsed lazily as an exact decimal;
+// `range`'s own numeric comparisons force it through the same float conversion jq's own eager
+// number parsing would give `1e1000` for free, overflowing to +-infinity.
+yields!(range_ip, "[limit(3; range(0; 1e1000; 1))]", [0, 1, 2]);
+yields!(range_in, "[limit(3; range(0; -1e1000; -1))]", [0, -1, -2]);
 // here, we diverge from jq, which just returns the empty list
 yields!(range_pz, "[limit(3; range(0; 6; 0))]", json!([0, 0, 0]));
 yields!(range_nz, "[limit(3; range(0; -6; 0))]", json!([0, 0, 0]));

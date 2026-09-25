@@ -23,9 +23,15 @@ fn index_access() {
     give(json!({"_a": 1}), "._a", json!(1));
     give(json!({"_0": 1}), "._0", json!(1));
 
-    // this diverges from jq, which fails here, because
-    // jaq can create objects with non-string keys
-    give(json!({"a": 1}), r#".[0]"#, json!(null));
+    // jaq objects can hold non-string keys (from `{(0): 1}`-style construction), so this used
+    // to just read as a miss (-> null) rather than fail here as it does in jq. This build
+    // follows jq's own behavior instead, since jq's behavior is the bar it's held to — see
+    // jaq-json's `index_type_error`. Verified against the oracle (exact wording and status).
+    fail(
+        json!({"a": 1}),
+        r#".[0]"#,
+        Error::str("Cannot index object with number (0)"),
+    );
 
     give(json!([0, 1, 2]), r#".["a", 0, 0 == 0]?"#, json!(0));
     give(json!([0, 1, 2]), r#".[3]?"#, json!(null));
