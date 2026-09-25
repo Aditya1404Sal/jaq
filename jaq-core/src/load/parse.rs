@@ -74,8 +74,6 @@ pub type Result<'s, 't, T> = core::result::Result<T, TError<'t, &'s str>>;
 pub struct Parser<'s, 't> {
     i: core::slice::Iter<'t, Token<&'s str>>,
     e: Vec<TError<'t, &'s str>>,
-    /// constant object keys, as written between their parentheses, in jq's order
-    const_keys: Vec<&'s str>,
 }
 
 /// Function from value to stream of values, such as `.[] | add / length`.
@@ -259,7 +257,6 @@ impl<'s, 't> Parser<'s, 't> {
         Self {
             i: i.iter(),
             e: Vec::new(),
-            const_keys: Vec::new(),
         }
     }
 
@@ -660,11 +657,7 @@ impl<'s, 't> Parser<'s, 't> {
         let key = match self.i.next() {
             Some(Token(x, Tok::Var)) => return Ok((Term::from_str(&x[1..]), Pattern::Var(x))),
             Some(Token(full, Tok::Block(tokens))) if full.starts_with('(') => {
-                let k = self.with(tokens, ")", Self::term);
-                self.just(":")?;
-                let p = self.pattern()?;
-                self.const_key(full, tokens, &k);
-                return Ok((k, p));
+                self.with(tokens, ")", Self::term)
             }
             Some(Token(id, Tok::Word)) if !id.contains("::") => Term::from_str(*id),
             _ => {
@@ -688,9 +681,7 @@ impl<'s, 't> Parser<'s, 't> {
             Some(Token(full, Tok::Block(tokens))) if full.starts_with('(') => {
                 let k = self.with(tokens, ")", Self::term);
                 self.just(":")?;
-                let v = self.term_with_comma(false)?;
-                self.const_key(full, tokens, &k);
-                return Ok((k, Some(v)));
+                return Ok((k, Some(self.term_with_comma(false)?)));
             }
             Some(Token(id, Tok::Var)) => Term::Var(*id),
             Some(Token(id, Tok::Word)) if !id.contains("::") => Term::from_str(*id),
@@ -701,28 +692,6 @@ impl<'s, 't> Parser<'s, 't> {
         };
         let v = self.char0(':').map(|_| self.term_with_comma(false));
         Ok((key, v.transpose()?))
-    }
-
-    /// Record a parenthesised object key that jq folds into a constant.
-    ///
-    /// jq checks such a key when it parses the entry (after its value), and refuses a
-    /// non-string one before running anything; the key is recorded as the text between the
-    /// parentheses, from its first token to its last.
-    fn const_key(&mut self, full: &'s str, tokens: &'t [Token<&'s str>], key: &Term<&'s str>) {
-        let [inner @ .., _close] = tokens else {
-            return;
-        };
-        let (Some(first), Some(last)) = (inner.first(), inner.last()) else {
-            return;
-        };
-        if !key.is_const() {
-            return;
-        }
-        let offset = |s: &str| s.as_ptr() as usize - full.as_ptr() as usize;
-        let (start, end) = (offset(first.0), offset(last.0) + last.0.len());
-        if let Some(text) = full.get(start..end) {
-            self.const_keys.push(text);
-        }
     }
 
     fn str_parts(
@@ -880,14 +849,8 @@ impl<'s, 't> Parser<'s, 't> {
         .collect::<Result<_>>()?;
 
         let body = f(self)?;
-        let const_keys = core::mem::take(&mut self.const_keys);
 
-        Ok(Module {
-            meta,
-            deps,
-            body,
-            const_keys,
-        })
+        Ok(Module { meta, deps, body })
     }
 }
 
@@ -910,8 +873,6 @@ pub(crate) struct Module<S, B> {
     pub meta: Option<Term<S>>,
     pub deps: Vec<Dep<S>>,
     pub body: B,
-    /// constant parenthesised object keys (see [`Parser::const_key`])
-    pub const_keys: Vec<S>,
 }
 
 /// jq definition, consisting of a name, optional arguments, and a body.

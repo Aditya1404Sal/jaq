@@ -113,8 +113,6 @@ pub struct Module<S, B = Vec<Def<S>>> {
     pub(crate) vars: Vars<S>,
     /// everything that comes after metadata and includes/imports
     pub(crate) body: B,
-    /// constant parenthesised object keys, as written
-    pub(crate) const_keys: Vec<S>,
 }
 
 /// Tree of modules containing definitions, and a main module.
@@ -124,16 +122,6 @@ pub struct Modules<S, P> {
 }
 
 impl<S, P> Modules<S, P> {
-    /// Parenthesised object keys of the main module that jq folds into constants, each as
-    /// written between its parentheses, in the order jq checks them.
-    ///
-    /// jq refuses a program in which such a key is not a string before running it
-    /// (`Cannot use number (1) as object key`); a caller that evaluates these keys can do
-    /// the same.
-    pub fn const_keys(&self) -> &[S] {
-        &self.main.1.const_keys
-    }
-
     pub(crate) fn file_vars(&self) -> impl Iterator<Item = (&File<S, P>, &Vars<S>)> {
         let mod_vars = self.deps.iter().map(|(file, module)| (file, &module.vars));
         mod_vars.chain([(&self.main.0, &self.main.1.vars)])
@@ -174,7 +162,6 @@ impl<S: core::ops::Deref<Target = str>, B> parse::Module<S, B> {
                 mods,
                 vars,
                 body: self.body,
-                const_keys: self.const_keys,
             })
         } else {
             Err(Error::Io(errs))
@@ -424,6 +411,20 @@ fn parse_defs(code: &str) -> Result<parse::Module<&str, Vec<Def<&str>>>, Error<&
     parse::Parser::new(&tokens)
         .parse(|p| p.module(|p| p.defs()))
         .map_err(|e| Error::Parse(e.into_iter().map(conv_err).collect()))
+}
+
+/// Whether `code` is a term that jq compiles to a constant (`block_is_const`), folding it as jq's
+/// parser does: jq refuses a constant object key that is not a string, and module metadata that
+/// is not a constant object, before running anything. `false` for text that is not a term.
+///
+/// ~~~
+/// # use jaq_core::load::is_const_term;
+/// assert!(is_const_term("[1, {a: 1 + 1}]"));
+/// assert!(!is_const_term("-1"));
+/// assert!(!is_const_term("1,"));
+/// ~~~
+pub fn is_const_term(code: &str) -> bool {
+    parse(code, |p| p.term()).map_or(false, |term: Term<&str>| term.is_const())
 }
 
 /// Lex a string and parse resulting tokens, returning [`None`] if any error occurred.
