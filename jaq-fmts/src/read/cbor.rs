@@ -212,9 +212,7 @@ fn parse<R: Read>(header: Header, decoder: &mut Decoder<R>) -> Result<Val, PErro
         Header::Positive(pos) => Ok(Val::Num(Num::from_integral(pos))),
         Header::Negative(neg) => Ok(Val::Num(Num::from_integral(neg as i128 ^ !0))),
         Header::Float(f) => Ok(Val::from(f)),
-        Header::Array(size) => Ok(Val::Arr(
-            with_size(size, decoder, |h, d| parse(h, d))?.into(),
-        )),
+        Header::Array(size) => Ok(Val::arr(with_size(size, decoder, |h, d| parse(h, d))?)),
         Header::Map(size) => {
             let o = with_size(size, decoder, |h, d| {
                 Ok((parse(h, d)?, parse(d.pull()?, d)?))

@@ -55,7 +55,7 @@ impl Val {
             (Val::Arr(_), Val::Arr(y)) if y.is_empty() => Ok(Box::new(core::iter::empty())),
             (Val::Arr(x), Val::Arr(y)) => {
                 let iw = x.windows(y.len()).enumerate();
-                Ok(Box::new(iw.filter_map(|(i, w)| (w == **y).then_some(i))))
+                Ok(Box::new(iw.filter_map(|(i, w)| (w == &y[..]).then_some(i))))
             }
             (Val::Arr(x), y) => {
                 let ix = x.iter().enumerate();
@@ -71,15 +71,81 @@ impl Val {
     /// * for every key-value pair `k, v` in `b`,
     ///   there is a key-value pair `k, v'` in `a` such that `v'` contains `v`, or
     /// * `a` equals `b`.
+    ///
+    /// This decides on a stack of pending checks rather than recursing once per level of nesting.
     fn contains(&self, other: &Self) -> bool {
-        match (self, other) {
-            (Self::BStr(l), Self::BStr(r)) | (Self::TStr(l), Self::TStr(r)) => l.contains_str(&**r),
-            (Self::Arr(l), Self::Arr(r)) => r.iter().all(|r| l.iter().any(|l| l.contains(r))),
-            (Self::Obj(l), Self::Obj(r)) => r
-                .iter()
-                .all(|(k, r)| l.get(k).is_some_and(|l| l.contains(r))),
-            _ => self == other,
+        /// A check under way: whether every one of `rs` is contained in some element of `l`
+        /// (an array) or in the value at the same key (an object), or whether some element of
+        /// `ls` contains `r`.
+        enum Frame<'a> {
+            All(&'a Val, alloc::vec::IntoIter<(Option<&'a Val>, &'a Val)>),
+            Any(core::slice::Iter<'a, Val>, &'a Val),
         }
+        // Whether `l` contains `r` without looking into elements, or the frame that decides it.
+        fn start<'a>(l: &'a Val, r: &'a Val) -> Result<bool, Frame<'a>> {
+            match (l, r) {
+                (Val::BStr(l), Val::BStr(r)) | (Val::TStr(l), Val::TStr(r)) => {
+                    Ok(l.contains_str(&**r))
+                }
+                (Val::Arr(_), Val::Arr(rs)) => {
+                    let rs: alloc::vec::Vec<_> = rs.iter().map(|r| (None, r)).collect();
+                    Err(Frame::All(l, rs.into_iter()))
+                }
+                (Val::Obj(ls), Val::Obj(rs)) => {
+                    let rs: alloc::vec::Vec<_> = rs.iter().map(|(k, r)| (ls.get(k), r)).collect();
+                    Err(Frame::All(l, rs.into_iter()))
+                }
+                _ => Ok(l == r),
+            }
+        }
+        let mut stack = match start(self, other) {
+            Ok(b) => return b,
+            Err(frame) => alloc::vec::Vec::from([frame]),
+        };
+        // the answer of the check that just ended, for the one that waits on it
+        let mut answer: Option<bool> = None;
+        while let Some(frame) = stack.last_mut() {
+            let next = match frame {
+                Frame::All(_, _) if answer == Some(false) => {
+                    stack.pop();
+                    continue;
+                }
+                Frame::Any(_, _) if answer == Some(true) => {
+                    stack.pop();
+                    continue;
+                }
+                Frame::All(l, rs) => match rs.next() {
+                    None => {
+                        answer = Some(true);
+                        stack.pop();
+                        continue;
+                    }
+                    // an object's entry: the value at the same key must contain it
+                    Some((Some(l), r)) => start(l, r),
+                    Some((None, r)) => match l {
+                        Val::Arr(ls) => Err(Frame::Any(ls.iter(), r)),
+                        // a key missing from the object
+                        _ => Ok(false),
+                    },
+                },
+                Frame::Any(ls, r) => match ls.next() {
+                    None => {
+                        answer = Some(false);
+                        stack.pop();
+                        continue;
+                    }
+                    Some(l) => start(l, r),
+                },
+            };
+            match next {
+                Ok(b) => answer = Some(b),
+                Err(frame) => {
+                    answer = None;
+                    stack.push(frame);
+                }
+            }
+        }
+        answer.unwrap_or(true)
     }
 
     fn to_bytes(&self) -> Result<Bytes, Self> {

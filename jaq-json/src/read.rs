@@ -143,13 +143,13 @@ fn parse<L: LexAlloc>(next: u8, lexer: &mut L, depth: usize) -> Result<Val, hifi
         b'0'..=b'9' | b'+' | b'-' => Val::Num(parse_num(lexer)?),
         b'"' => Val::utf8_str(parse_string(lexer.discarded(), false)?),
         b'[' | b'{' if depth >= MAX_PARSE_DEPTH => Err(hifijson::Error::Depth)?,
-        b'[' => Val::Arr({
+        b'[' => Val::arr({
             let mut arr = Vec::new();
             lexer.discarded().seq(b']', ws_tk, |next, lexer| {
                 arr.push(parse(next, lexer, depth + 1)?);
                 Ok::<_, hifijson::Error>(())
             })?;
-            arr.into()
+            arr
         }),
         b'{' => Val::obj({
             let mut obj = Map::default();

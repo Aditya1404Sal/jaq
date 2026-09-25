@@ -395,7 +395,7 @@ impl Parser {
                     None => (),
                 }
                 if let Some(Frame::Arr(items)) = self.stack.pop() {
-                    self.next = Some(Val::Arr(items.into()));
+                    self.next = Some(Val::arr(items));
                 }
             }
             b'}' => {

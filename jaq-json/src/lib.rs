@@ -60,9 +60,9 @@ pub enum Val {
     /// replace invalid UTF-8 by the Unicode replacement character.
     TStr(Box<Bytes>),
     /// Array
-    Arr(Rc<Vec<Val>>),
+    Arr(Rc<Array>),
     /// Object
-    Obj(Rc<Map<Val, Val>>),
+    Obj(Rc<Object>),
 }
 
 #[cfg(feature = "sync")]
@@ -185,6 +185,145 @@ fn jq_array_index(i: &Num, len: usize) -> Option<usize> {
 /// Order-preserving map
 pub type Map<K = Val, V = K> = indexmap::IndexMap<K, V, foldhash::fast::RandomState>;
 
+/// The elements of an array.
+///
+/// This is a vector of values that is dropped without recursing into the arrays and objects it
+/// holds (see [`drop_deep`]), so that a value nested arbitrarily deep, as a filter can build it,
+/// can be dropped.
+#[derive(Clone, Debug, Default, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct Array(Vec<Val>);
+
+/// The entries of an object, dropped as [`Array`] is.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct Object(Map<Val, Val>);
+
+/// Drop values without recursing: the elements of each array or object dropped last are moved
+/// onto an explicit stack first.
+fn drop_deep(mut stack: Vec<Val>) {
+    while let Some(v) = stack.pop() {
+        match v {
+            Val::Arr(a) => {
+                if let Ok(mut a) = Rc::try_unwrap(a) {
+                    stack.append(&mut a.0);
+                }
+            }
+            Val::Obj(o) => {
+                if let Ok(mut o) = Rc::try_unwrap(o) {
+                    stack.extend(
+                        core::mem::take(&mut o.0)
+                            .into_iter()
+                            .flat_map(|(k, v)| [k, v]),
+                    );
+                }
+            }
+            _ => (),
+        }
+    }
+}
+
+const fn is_container(v: &Val) -> bool {
+    matches!(v, Val::Arr(_) | Val::Obj(_))
+}
+
+impl Drop for Array {
+    fn drop(&mut self) {
+        if self.0.iter().any(is_container) {
+            drop_deep(core::mem::take(&mut self.0));
+        }
+    }
+}
+
+impl Drop for Object {
+    fn drop(&mut self) {
+        if self.0.values().any(is_container) {
+            let entries = core::mem::take(&mut self.0);
+            drop_deep(entries.into_iter().flat_map(|(k, v)| [k, v]).collect());
+        }
+    }
+}
+
+impl core::ops::Deref for Array {
+    type Target = Vec<Val>;
+    fn deref(&self) -> &Vec<Val> {
+        &self.0
+    }
+}
+
+impl core::ops::DerefMut for Array {
+    fn deref_mut(&mut self) -> &mut Vec<Val> {
+        &mut self.0
+    }
+}
+
+impl core::ops::Deref for Object {
+    type Target = Map<Val, Val>;
+    fn deref(&self) -> &Map<Val, Val> {
+        &self.0
+    }
+}
+
+impl core::ops::DerefMut for Object {
+    fn deref_mut(&mut self) -> &mut Map<Val, Val> {
+        &mut self.0
+    }
+}
+
+impl From<Vec<Val>> for Array {
+    fn from(v: Vec<Val>) -> Self {
+        Self(v)
+    }
+}
+
+impl From<Map<Val, Val>> for Object {
+    fn from(m: Map<Val, Val>) -> Self {
+        Self(m)
+    }
+}
+
+impl FromIterator<Val> for Array {
+    fn from_iter<I: IntoIterator<Item = Val>>(iter: I) -> Self {
+        Self(iter.into_iter().collect())
+    }
+}
+
+impl FromIterator<(Val, Val)> for Object {
+    fn from_iter<I: IntoIterator<Item = (Val, Val)>>(iter: I) -> Self {
+        Self(iter.into_iter().collect())
+    }
+}
+
+impl IntoIterator for Array {
+    type Item = Val;
+    type IntoIter = alloc::vec::IntoIter<Val>;
+    fn into_iter(mut self) -> Self::IntoIter {
+        core::mem::take(&mut self.0).into_iter()
+    }
+}
+
+impl IntoIterator for Object {
+    type Item = (Val, Val);
+    type IntoIter = indexmap::map::IntoIter<Val, Val>;
+    fn into_iter(mut self) -> Self::IntoIter {
+        core::mem::take(&mut self.0).into_iter()
+    }
+}
+
+impl<'a> IntoIterator for &'a Array {
+    type Item = &'a Val;
+    type IntoIter = core::slice::Iter<'a, Val>;
+    fn into_iter(self) -> Self::IntoIter {
+        self.0.iter()
+    }
+}
+
+impl<'a> IntoIterator for &'a Object {
+    type Item = (&'a Val, &'a Val);
+    type IntoIter = indexmap::map::Iter<'a, Val, Val>;
+    fn into_iter(self) -> Self::IntoIter {
+        self.0.iter()
+    }
+}
+
 /// Error that can occur during filter execution.
 pub type Error = jaq_core::Error<Val>;
 /// A value or an eRror.
@@ -291,7 +430,7 @@ impl jaq_core::ValT for Val {
             // jq treats null as an empty object or array when updating it by key or index.
             Val::Null => match index {
                 Val::TStr(_) | Val::BStr(_) => Val::obj(Map::default()).map_index(index, opt, f),
-                Val::Num(_) => Val::Arr(Rc::new(Vec::new())).map_index(index, opt, f),
+                Val::Num(_) => Val::Arr(Rc::default()).map_index(index, opt, f),
                 _ => opt.fail(self, |v| Exn::from(index_type_error(&v, index))),
             },
             // jq reads the field first, and only a string names an object's field.
@@ -586,7 +725,12 @@ fn abs_index(i: num::PosUsize, len: usize) -> Option<usize> {
 impl Val {
     /// Construct an object value.
     pub fn obj(m: Map) -> Self {
-        Self::Obj(m.into())
+        Self::Obj(Rc::new(Object(m)))
+    }
+
+    /// Construct an array value.
+    pub fn arr(v: Vec<Self>) -> Self {
+        Self::Arr(Rc::new(Array(v)))
     }
 
     /// Construct a string that is interpreted as UTF-8.
@@ -621,14 +765,14 @@ impl Val {
     }
 
     /// If the value is an array, return it, else fail.
-    fn into_arr(self) -> Result<Rc<Vec<Self>>, Error> {
+    fn into_arr(self) -> Result<Rc<Array>, Error> {
         match self {
             Self::Arr(a) => Ok(a),
             _ => Err(Error::typ(self, Type::Arr.as_str())),
         }
     }
 
-    fn as_arr(&self) -> Result<&Rc<Vec<Self>>, Error> {
+    fn as_arr(&self) -> Result<&Rc<Array>, Error> {
         match self {
             Self::Arr(a) => Ok(a),
             _ => Err(Error::typ(self.clone(), Type::Arr.as_str())),
@@ -636,9 +780,7 @@ impl Val {
     }
 
     fn to_json(&self) -> Vec<u8> {
-        let mut buf = write::Buf(Vec::new());
-        write::write_buf(&mut buf, &write::Pp::default(), 0, self).unwrap();
-        buf.0
+        write::to_json(self)
     }
 
     fn index_opt(self, index: &Self) -> Result<Option<Val>, Error> {
@@ -652,7 +794,7 @@ impl Val {
             (Val::Arr(x), Val::Arr(y)) => {
                 // adapted from the implementation of the `indices` filter
                 let iw = x.windows(y.len()).enumerate();
-                let indices = iw.filter_map(|(i, w)| (w == **y).then_some(i));
+                let indices = iw.filter_map(|(i, w)| (w == &y[..]).then_some(i));
                 Some(indices.map(Val::from).collect())
             }
             // jq only ever indexes an object by a string key; a non-string index (`{}[0]`) is a
@@ -762,16 +904,57 @@ impl core::ops::Sub for Val {
     }
 }
 
-fn obj_merge(l: &mut Rc<Map>, r: Rc<Map>) {
-    let l = Rc::make_mut(l);
-    let r = rc_unwrap_or_clone(r).into_iter();
-    r.for_each(|(k, v)| match (l.get_mut(&k), v) {
-        (Some(Val::Obj(l)), Val::Obj(r)) => obj_merge(l, r),
-        (Some(l), r) => *l = r,
-        (None, r) => {
-            l.insert(k, r);
+/// Merge `r` into `l` recursively (`l * r`), without recursing once per level of nesting: an
+/// object being merged into waits on a stack, its merged entry taken out (left `null`) until its
+/// merge is done.
+fn obj_merge(l: &mut Rc<Object>, r: Rc<Object>) {
+    struct Frame {
+        l: Object,
+        r: <Object as IntoIterator>::IntoIter,
+        key: Option<Val>,
+    }
+    let mut stack = Vec::from([Frame {
+        l: core::mem::take(Rc::make_mut(l)),
+        r: rc_unwrap_or_clone(r).into_iter(),
+        key: None,
+    }]);
+    loop {
+        let Some(top) = stack.last_mut() else {
+            return;
+        };
+        match top.r.next() {
+            Some((k, Val::Obj(r))) if matches!(top.l.get(&k), Some(Val::Obj(_))) => {
+                let Some(Val::Obj(l)) = top.l.get_mut(&k).map(core::mem::take) else {
+                    unreachable!()
+                };
+                stack.push(Frame {
+                    l: rc_unwrap_or_clone(l),
+                    r: rc_unwrap_or_clone(r).into_iter(),
+                    key: Some(k),
+                });
+            }
+            Some((k, v)) => {
+                top.l.insert(k, v);
+            }
+            None => {
+                let Some(mut done) = stack.pop() else {
+                    return;
+                };
+                let merged = core::mem::take(&mut done.l);
+                match (stack.last_mut(), done.key.take()) {
+                    (Some(parent), Some(key)) => {
+                        if let Some(slot) = parent.l.get_mut(&key) {
+                            *slot = Val::Obj(Rc::new(merged));
+                        }
+                    }
+                    _ => {
+                        *Rc::make_mut(l) = merged;
+                        return;
+                    }
+                }
+            }
         }
-    });
+    }
 }
 
 /// jq caps a repeated string's result length at `INT_MAX` (its `jv` string length field is a
@@ -915,15 +1098,22 @@ impl PartialOrd for Val {
     }
 }
 
-impl Ord for Val {
-    fn cmp(&self, other: &Self) -> Ordering {
+/// What comparing two values shallowly tells: their order, or that their elements (an array's
+/// in order, an object's values in the order of its sorted keys) decide it, lexicographically.
+enum Shallow<'a> {
+    Decided(Ordering),
+    Elements(alloc::vec::IntoIter<&'a Val>, alloc::vec::IntoIter<&'a Val>),
+}
+
+impl Val {
+    fn cmp_shallow<'a>(&'a self, other: &'a Self) -> Shallow<'a> {
         use Ordering::{Equal, Greater, Less};
-        match (self, other) {
-            (Self::Null, Self::Null) => Equal,
-            (Self::Bool(x), Self::Bool(y)) => x.cmp(y),
-            (Self::Num(x), Self::Num(y)) => x.cmp(y),
-            (Self::BStr(x) | Self::TStr(x), Self::BStr(y) | Self::TStr(y)) => x.cmp(y),
-            (Self::Arr(x), Self::Arr(y)) => x.cmp(y),
+        Shallow::Decided(match (self, other) {
+            (Self::Arr(x), Self::Arr(y)) => {
+                let l: Vec<_> = x.iter().collect();
+                let r: Vec<_> = y.iter().collect();
+                return Shallow::Elements(l.into_iter(), r.into_iter());
+            }
             (Self::Obj(x), Self::Obj(y)) => match (x.len(), y.len()) {
                 (0, 0) => Equal,
                 (0, _) => Less,
@@ -933,14 +1123,63 @@ impl Ord for Val {
                     let mut r: Vec<_> = y.iter().collect();
                     l.sort_by_key(|(k, _v)| *k);
                     r.sort_by_key(|(k, _v)| *k);
-                    // TODO: make this nicer
                     let kl = l.iter().map(|(k, _v)| k);
                     let kr = r.iter().map(|(k, _v)| k);
-                    let vl = l.iter().map(|(_k, v)| v);
-                    let vr = r.iter().map(|(_k, v)| v);
-                    kl.cmp(kr).then_with(|| vl.cmp(vr))
+                    match kl.cmp(kr) {
+                        Equal => {
+                            let vl: Vec<_> = l.iter().map(|(_k, v)| *v).collect();
+                            let vr: Vec<_> = r.iter().map(|(_k, v)| *v).collect();
+                            return Shallow::Elements(vl.into_iter(), vr.into_iter());
+                        }
+                        ord => ord,
+                    }
                 }
             },
+            (x, y) => x.cmp_scalar(y),
+        })
+    }
+}
+
+impl Ord for Val {
+    /// Compare values, arrays and objects element by element, without recursing once per level
+    /// of nesting.
+    fn cmp(&self, other: &Self) -> Ordering {
+        use Ordering::{Equal, Greater, Less};
+        let mut stack: Vec<(alloc::vec::IntoIter<&Val>, alloc::vec::IntoIter<&Val>)> = Vec::new();
+        let mut pair = Some((self, other));
+        loop {
+            if let Some((x, y)) = pair.take() {
+                match x.cmp_shallow(y) {
+                    Shallow::Decided(Equal) => (),
+                    Shallow::Decided(ord) => return ord,
+                    Shallow::Elements(l, r) => stack.push((l, r)),
+                }
+            }
+            let Some((l, r)) = stack.last_mut() else {
+                return Equal;
+            };
+            match (l.next(), r.next()) {
+                (Some(x), Some(y)) => pair = Some((x, y)),
+                (None, None) => {
+                    stack.pop();
+                }
+                (None, Some(_)) => return Less,
+                (Some(_), None) => return Greater,
+            }
+        }
+    }
+}
+
+impl Val {
+    /// Compare values that are not both arrays or both objects.
+    fn cmp_scalar(&self, other: &Self) -> Ordering {
+        use Ordering::{Equal, Greater, Less};
+        match (self, other) {
+            (Self::Null, Self::Null) => Equal,
+            (Self::Bool(x), Self::Bool(y)) => x.cmp(y),
+            (Self::Num(x), Self::Num(y)) => x.cmp(y),
+            (Self::BStr(x) | Self::TStr(x), Self::BStr(y) | Self::TStr(y)) => x.cmp(y),
+            (Self::Arr(_), Self::Arr(_)) | (Self::Obj(_), Self::Obj(_)) => Equal,
 
             // nulls are smaller than anything else
             (Self::Null, _) => Less,
@@ -961,16 +1200,33 @@ impl Ord for Val {
 }
 
 impl PartialEq for Val {
+    /// Compare values for equality, arrays and objects element by element, without recursing
+    /// once per level of nesting.
     fn eq(&self, other: &Self) -> bool {
-        match (self, other) {
-            (Self::Null, Self::Null) => true,
-            (Self::Bool(x), Self::Bool(y)) => x == y,
-            (Self::Num(x), Self::Num(y)) => x == y,
-            (Self::BStr(x) | Self::TStr(x), Self::BStr(y) | Self::TStr(y)) => x == y,
-            (Self::Arr(x), Self::Arr(y)) => x == y,
-            (Self::Obj(x), Self::Obj(y)) => x == y,
-            _ => false,
+        let mut pairs = Vec::from([(self, other)]);
+        while let Some(pair) = pairs.pop() {
+            match pair {
+                (Self::Null, Self::Null) => (),
+                (Self::Bool(x), Self::Bool(y)) if x == y => (),
+                (Self::Num(x), Self::Num(y)) if x == y => (),
+                (Self::BStr(x) | Self::TStr(x), Self::BStr(y) | Self::TStr(y)) if x == y => (),
+                (Self::Arr(x), Self::Arr(y)) if Rc::ptr_eq(x, y) => (),
+                (Self::Arr(x), Self::Arr(y)) if x.len() == y.len() => {
+                    pairs.extend(x.iter().zip(y.iter()));
+                }
+                (Self::Obj(x), Self::Obj(y)) if Rc::ptr_eq(x, y) => (),
+                (Self::Obj(x), Self::Obj(y)) if x.len() == y.len() => {
+                    for (k, v) in x.iter() {
+                        match y.get(k) {
+                            Some(w) => pairs.push((v, w)),
+                            None => return false,
+                        }
+                    }
+                }
+                _ => return false,
+            }
         }
+        true
     }
 }
 

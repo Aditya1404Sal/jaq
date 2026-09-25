@@ -113,7 +113,7 @@ fn row<E, I: Iterator<Item = Result<u8, E>>>(
             None if fields.is_empty() && field.is_empty() => return None,
             None | Some(b'\n') => {
                 fields.push(field.into());
-                return Some(Ok(Val::Arr(fields.into())));
+                return Some(Ok(Val::arr(fields)));
             }
             _ => fields.push(field.into()),
         }
