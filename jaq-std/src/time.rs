@@ -23,22 +23,6 @@ fn timestamp_to_epoch<V: ValT>(ts: Timestamp, frac: bool) -> ValR<V> {
     }
 }
 
-fn array_to_datetime<V: ValT>(v: &[V]) -> Option<Result<DateTime, jiff::Error>> {
-    let [year, month, day, hour, min, sec]: &[V; 6] = v.get(..6)?.try_into().ok()?;
-    let sec = sec.as_f64()?;
-    let i8 = |v: &V| -> Option<i8> { v.as_isize()?.try_into().ok() };
-    Some(DateTime::new(
-        year.as_isize()?.try_into().ok()?,
-        i8(month)? + 1,
-        i8(day)?,
-        i8(hour)?,
-        i8(min)?,
-        // the `as i8` cast saturates, returning a number in the range [-128, 128]
-        sec.floor() as i8,
-        (sec.fract() * 1e9) as i32,
-    ))
-}
-
 /// Convert a `DateTime` to a "broken down time" array
 fn datetime_to_array<V: ValT>(dt: DateTime) -> [V; 8] {
     [
@@ -83,14 +67,32 @@ pub fn to_iso8601<V: ValT>(v: &V) -> Result<String, Error<V>> {
 /// then it is assumed to be in the given timezone.
 /// When the input is an integer, i.e. a Unix epoch,
 /// then it is *converted* to the given timezone.
-pub fn strftime<V: ValT>(v: &V, fmt: &str, tz: tz::TimeZone) -> ValR<V> {
-    let fail = || Error::str(format_args!("cannot convert {v} to time"));
-    let zoned = match v.clone().into_vec() {
-        Ok(v) => array_to_datetime(&v)
-            .ok_or_else(fail)?
-            .and_then(|dt| dt.to_zoned(tz))
-            .map_err(Error::str)?,
-        Err(_) => epoch_to_timestamp(v)?.to_zoned(tz),
+pub fn strftime<V: ValT>(v: &V, fmt: &V, tz: tz::TimeZone, name: &str) -> ValR<V> {
+    let inputs = || Error::str(format_args!("{name}/1 requires parsed datetime inputs"));
+    let zoned = match v.clone().into_seq::<alloc::vec::Vec<V>>() {
+        // jq normalizes a broken-down time as `timegm` does, and shows its wall clock.
+        Ok(bdt) => {
+            let fmt_ok = fmt.as_utf8_bytes().is_some();
+            if !fmt_ok {
+                return Err(Error::str(format_args!(
+                    "{name}/1 requires a string format"
+                )));
+            }
+            let seconds = broken_down_to_epoch(&bdt).ok_or_else(inputs)?;
+            Timestamp::from_second(seconds)
+                .map_err(Error::str)?
+                .to_zoned(tz::TimeZone::UTC)
+        }
+        Err(v) if v.kind_name() == "number" => epoch_to_timestamp(&v)?.to_zoned(tz),
+        Err(_) => return Err(inputs()),
+    };
+    let fmt = match fmt.as_utf8_bytes().map(core::str::from_utf8) {
+        Some(Ok(fmt)) => fmt,
+        _ => {
+            return Err(Error::str(format_args!(
+                "{name}/1 requires a string format"
+            )))
+        }
     };
     strtime::format(fmt, &zoned)
         .map(V::from)
@@ -105,7 +107,8 @@ pub fn gmtime<V: ValT>(v: &V, tz: tz::TimeZone) -> ValR<V> {
 
 /// Parse a string into a "broken down time" array.
 pub fn strptime<V: ValT>(s: &str, fmt: &str) -> ValR<V> {
-    let mut bdt = strtime::BrokenDownTime::parse(fmt, s).map_err(Error::str)?;
+    let nomatch = |_| Error::str(format_args!("date \"{s}\" does not match format \"{fmt}\""));
+    let mut bdt = strtime::BrokenDownTime::parse(fmt, s).map_err(nomatch)?;
     if (bdt.offset(), bdt.iana_time_zone()) == (None, None) {
         bdt.set_offset(Some(tz::Offset::UTC));
     }
@@ -113,13 +116,43 @@ pub fn strptime<V: ValT>(s: &str, fmt: &str) -> ValR<V> {
     datetime_to_array(dt).into_iter().map(Ok).collect()
 }
 
-/// Parse an array into a UNIX epoch timestamp.
+/// Parse an array into a UNIX epoch timestamp, as jq's `mktime` (`jv2tm`, then `timegm`).
 pub fn mktime<V: ValT>(v: &V) -> ValR<V> {
-    let fail = || Error::str(format_args!("cannot convert {v} to time"));
-    let ts = array_to_datetime(&v.clone().into_vec()?)
-        .ok_or_else(fail)?
-        .and_then(|dt| dt.to_zoned(tz::TimeZone::UTC))
-        .map_err(Error::str)?
-        .timestamp();
-    timestamp_to_epoch(ts, ts.subsec_nanosecond() > 0)
+    let bdt: alloc::vec::Vec<V> = v
+        .clone()
+        .into_seq()
+        .map_err(|_| Error::str("mktime requires array inputs"))?;
+    let seconds = broken_down_to_epoch(&bdt)
+        .ok_or_else(|| Error::str("mktime requires parsed datetime inputs"))?;
+    isize::try_from(seconds)
+        .map(V::from)
+        .or_else(|_| V::from_num(&seconds.to_string()))
+}
+
+/// jq's `jv2tm` and `timegm`: the leading numbers of a broken-down time (missing ones 0), each
+/// truncated to an integer, normalized into seconds since the epoch. `None` for an element that
+/// is not a number.
+fn broken_down_to_epoch<V: ValT>(bdt: &[V]) -> Option<i64> {
+    let mut tm = [0i64; 6];
+    for (i, v) in bdt.iter().take(8).enumerate() {
+        let d = v.as_f64().filter(|d| !d.is_nan())?;
+        let d = if i == 0 { d - 1900.0 } else { d };
+        #[allow(clippy::cast_possible_truncation)]
+        let n = d.clamp(f64::from(i32::MIN), f64::from(i32::MAX)) as i64;
+        if let Some(field) = tm.get_mut(i) {
+            *field = n;
+        }
+    }
+    let [year, month, mday, hour, min, sec] = tm;
+    let year = year + 1900 + month.div_euclid(12);
+    let month = month.rem_euclid(12) + 1;
+    // Howard Hinnant's `days_from_civil`.
+    let y = if month <= 2 { year - 1 } else { year };
+    let era = y.div_euclid(400);
+    let yoe = y - era * 400;
+    let mp = (month + 9) % 12;
+    let doy = (153 * mp + 2) / 5;
+    let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
+    let days = era * 146_097 + doe - 719_468 + (mday - 1);
+    Some(days * 86_400 + hour * 3_600 + min * 60 + sec)
 }

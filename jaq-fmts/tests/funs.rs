@@ -36,8 +36,9 @@ yields!(toyaml_str, r#""abc" | toyaml"#, r#"abc"#);
 yields!(toyaml_arr, r#"[0.0, "abc"] | toyaml"#, r#"[0.0, abc]"#);
 yields!(
     toyaml_obj,
-    "{a: 1, (true): 2, (3): 4} | toyaml",
-    "{a: 1, true: 2, 3: 4}"
+    // as in jq, an object key is a string
+    "try ({a: 1, (true): 2, (3): 4} | toyaml) catch .",
+    "Cannot use boolean (true) as object key"
 );
 yields!(
     toyaml_ff,

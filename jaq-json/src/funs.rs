@@ -7,6 +7,19 @@ use jaq_core::native::{bome, run, unary, v, Filter, Fun};
 use jaq_core::{DataT, RunPtr};
 use jaq_std::ValT as _;
 
+/// jq's value kinds, where `true` and `false` are two.
+fn jq_kind(v: &Val) -> u8 {
+    match v {
+        Val::Null => 0,
+        Val::Bool(false) => 1,
+        Val::Bool(true) => 2,
+        Val::Num(_) => 3,
+        Val::TStr(_) | Val::BStr(_) => 4,
+        Val::Arr(_) => 5,
+        Val::Obj(_) => 6,
+    }
+}
+
 impl Val {
     /// Return 0 for null, the absolute value for numbers, and
     /// the length for strings, arrays, and objects.
@@ -20,7 +33,7 @@ impl Val {
             Val::BStr(b) => Ok(Val::from(b.len())),
             Val::Arr(a) => Ok(Val::from(a.len())),
             Val::Obj(o) => Ok(Val::from(o.len())),
-            Val::Bool(_) => Err(Error::str(format_args!("{self} has no length"))),
+            Val::Bool(_) => Err(crate::type_error(self, "has no length")),
         }
     }
 
@@ -174,11 +187,32 @@ fn base<D: for<'a> DataT<V<'a> = Val>>() -> Box<[Filter<RunPtr<D>>]> {
             bome(cv.1.to_bytes().map(Val::byte_str).map_err(fail))
         }),
         ("length", v(0), |cv| bome(cv.1.length())),
+        // jq checks containment only between values of one kind (`true` and `false` are two).
         ("contains", v(1), |cv| {
-            unary(cv, |x, y| Ok(Val::from(x.contains(&y))))
+            unary(cv, |x, y| {
+                if jq_kind(&x) != jq_kind(&y) {
+                    let message = "cannot have their containment checked";
+                    return Err(crate::type_error2(&x, &y, message));
+                }
+                Ok(Val::from(x.contains(&y)))
+            })
         }),
         ("has", v(1), |cv| {
-            unary(cv, |v, k| v.index_opt(&k).map(|o| o.is_some().into()))
+            unary(cv, |v, k| match (&v, &k) {
+                (Val::Obj(o), Val::TStr(_) | Val::BStr(_)) => Ok(o.contains_key(&k).into()),
+                (Val::Arr(a), Val::Num(n)) => {
+                    // jq truncates the index; NaN and negative indices are never present.
+                    let d = n.as_f64();
+                    #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+                    let present = !d.is_nan() && d > -1.0 && (d as usize) < a.len();
+                    Ok(present.into())
+                }
+                _ => Err(Error::str(format_args!(
+                    "Cannot check whether {} has a {} key",
+                    crate::type_name(&v),
+                    crate::type_name(&k)
+                ))),
+            })
         }),
         ("indices", v(1), |cv| {
             let to_int = |i: usize| Val::from(i as isize);

@@ -30,3 +30,15 @@ def fromstream(i): {x: null, e: false} as $init |
 def truncate_stream(stream):
   . as $n | null | stream | . as $input |
   if (.[0] | length) > $n then setpath([0]; $input[0][$n:]) else empty end;
+
+# jq 1.8's object builders: a key that is not a string is an error
+def from_entries: map({ (.key // .Key // .name // .Name):
+  if has("value") then .value else .Value end }) | add // {};
+def with_entries(f): to_entries | map(f) | from_entries;
+
+# jq 1.8's `reverse`: through indices, so a string or number errs and `null` gives `[]`
+def reverse: [.[length - 1 - range(0; length)]];
+
+# jq 1.8's `combinations`, through indices
+def combinations: if length == 0 then [] else .[0][] as $x | (.[1:] | combinations) as $y | [$x] + $y end;
+def combinations(n): . as $dot | [range(n) | $dot] | combinations;

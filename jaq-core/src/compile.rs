@@ -225,6 +225,9 @@ pub struct Compiler<S, F> {
     locals: Locals<S>,
 
     errs: Vec<Error<S>>,
+
+    /// The code of the module being compiled, where `$__loc__` finds its line.
+    code: Option<S>,
 }
 
 type Def<S> = (Sig<S>, TermId, Tr);
@@ -243,6 +246,7 @@ impl<S, F> Default for Compiler<S, F> {
             imported_vars: Vec::new(),
             locals: Locals::default(),
             errs: Vec::new(),
+            code: None,
         }
     }
 }
@@ -511,12 +515,14 @@ impl<'s, F> Compiler<&'s str, F> {
 
         let mut errs = Vec::new();
         for (file, module) in mods.deps {
+            self.code = Some(file.code);
             let defs = self.open_module(module);
             let defs = self.module(defs);
             self.mod_map.push(defs);
             self.close_module(file, &mut errs)
         }
         let (file, module) = mods.main;
+        self.code = Some(file.code);
         let main = self.open_module(module);
         let id = self.iterm(main);
         self.close_module(file, &mut errs);
@@ -665,7 +671,12 @@ impl<'s, F> Compiler<&'s str, F> {
 
                 return (t, tr_);
             }
-            Num(n) => n.parse().map_or_else(|_| Term::Num(n.into()), Term::Int),
+            // A zero literal is left to the value type, which may tell it from a computed zero
+            // (jq negates a literal zero to `0` and a computed one to `-0`).
+            Num(n) => match n.parse() {
+                Ok(0) | Err(_) => Term::Num(n.into()),
+                Ok(i) => Term::Int(i),
+            },
             TryCatch(try_, catch) => {
                 let catch = catch.map_or_else(|| Call("!empty", Vec::new()), |t| *t);
                 Term::TryCatch(self.iterm(*try_), self.iterm(catch))
@@ -865,7 +876,28 @@ impl<'s, F> Compiler<&'s str, F> {
                 i += 1;
             }
         }
+        if x == "$__loc__" {
+            return self.loc(x);
+        }
         self.fail(x, Undefined::Var)
+    }
+
+    /// jq's `$__loc__`: `{"file": "<top-level>", "line": N}` for where it is written.
+    fn loc(&mut self, x: &'s str) -> Term {
+        let offset = self
+            .code
+            .and_then(|code| (x.as_ptr() as usize).checked_sub(code.as_ptr() as usize))
+            .unwrap_or(0);
+        let before = self.code.map_or("", |code| &code[..offset.min(code.len())]);
+        let line = before.matches('\n').count() + 1;
+        let mut entry = |k: &str, v: Term| {
+            let k = self.lut.insert_term(Term::Str(k.into()));
+            let v = self.lut.insert_term(v);
+            Term::ObjSingle(k, v)
+        };
+        let file = entry("file", Term::Str("<top-level>".into()));
+        let line = entry("line", Term::Int(line as isize));
+        self.sum_or(|| Term::ObjEmpty, alloc::vec![file, line])
     }
 
     fn break_(&mut self, x: &'s str) -> Term {

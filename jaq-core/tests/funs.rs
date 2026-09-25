@@ -2,7 +2,7 @@
 
 pub mod common;
 
-use common::{fail, give, gives, Error, Val};
+use common::{fail, give, gives, Error};
 use serde_json::json;
 
 yields!(repeat, "def r(f): f, r(f); [limit(3; r(1, 2))]", [1, 2, 1]);
@@ -37,9 +37,10 @@ fn keys_unsorted() {
     give(json!([0, null, "a"]), "keys_unsorted", json!([0, 1, 2]));
     give(json!({"a": 1, "b": 2}), "keys_unsorted", json!(["a", "b"]));
 
-    let err = |v| Error::typ(v, "iterable (array or object)");
-    fail(json!(0), "keys_unsorted", err(Val::from(0usize)));
-    fail(json!(null), "keys_unsorted", err(Val::Null));
+    // jq's wording
+    let err = |s: &str| Error::str(s);
+    fail(json!(0), "keys_unsorted", err("number (0) has no keys"));
+    fail(json!(null), "keys_unsorted", err("null (null) has no keys"));
 }
 
 #[test]

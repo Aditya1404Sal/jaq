@@ -25,7 +25,9 @@ def until(cond; update): def rec: if cond then . else update | rec end; rec;
 # Paths
 def paths:    skip(1; path      (..));
 def paths(p): skip(1; path_value(..)) | if .[1] | p then .[0] else empty end;
-def getpath($path): reduce $path[] as $p (.; .[$p]);
+def getpath($path):
+  if $path | . >= [] and . < {} then reduce $path[] as $p (.; .[$p])
+  else error("Path must be specified as an array") end;
 def setpath($path; $x): getpath($path) = $x;
 
 # Updates
@@ -41,8 +43,19 @@ def map(f): [.[] | f];
 # this (jaq-core) definition file — and this is defined here, not down with the rest of
 # "Paths" above, because it needs `map` to already exist.
 def delpaths($paths):
+  if $paths | . >= [] and . < {} | not then error("Paths must be specified as an array") end |
+  reduce $paths[] as $p (.;
+    if $p | . >= [] and . < {} then . else
+      ($p | if . < false then "null" elif . == true or . == false then "boolean"
+       elif . < "" then "number" elif . < [] then "string" else "object" end) as $kind
+      | error("Path must be specified as array, not \($kind)")
+    end) |
+  # deleting the whole value leaves null
+  if $paths | map(select(. == [])) != [] then [][0] else
+  # a path through a missing value deletes nothing, as in jq
   reduce ($paths | reduce .[] as $p ([]; map(select(. > $p)) + [$p] + map(select(. <= $p))))[]
-    as $path (.; getpath($path) |= empty);
+    as $path (.; if $path[1:] != [] and getpath($path[:-1]) == [][0] then .
+      else getpath($path) |= empty end) end;
 def map_values(f): .[] |= f;
 def walk(f): .. |= f;
 # `f |= empty` (the previous definition) applies each of `f`'s paths against the
@@ -64,8 +77,6 @@ def nth($n; g): if $n < 0 then error("nth doesn't support negative indices") els
 
 # Objects <-> Arrays
 def   to_entries: [key_values[] as [$key, $value] | { $key, $value }];
-def from_entries: reduce (.[] | { (.key): .value }) as $x ({}; . + $x);
-def with_entries(f): to_entries | map(f) | from_entries;
 
 # Predicates
 def isempty(g): first((g | false), true);

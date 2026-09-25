@@ -34,6 +34,19 @@ enum State {
     Normal,
     Str,
     StrEscape,
+    /// `--seq` input before its first record separator, or waiting to resync after an error.
+    WaitingForRs,
+}
+
+/// ASCII RS, which starts each text of a JSON text sequence (`--seq`).
+const RS: u8 = 0x1E;
+
+/// What one scanned byte leaves the parser with.
+enum Step {
+    Continue,
+    Value(Val),
+    /// Stop scanning for now with nothing to show (an RS that ends nothing).
+    Stop,
 }
 
 /// What the parser has for its caller next (`jv_parser_next`'s three outcomes).
@@ -48,8 +61,12 @@ pub enum Next {
     More,
 }
 
-/// jq's `struct jv_parser`, without its `--seq` and `--stream` modes.
+/// jq's `struct jv_parser`, with its `--seq` mode but not `--stream`.
 pub struct Parser {
+    /// Reading a JSON text sequence (`--seq`).
+    seq: bool,
+    /// Whether the byte scanned last was whitespace.
+    last_ch_was_ws: bool,
     stack: Vec<Frame>,
     next: Option<Val>,
     token: Vec<u8>,
@@ -76,11 +93,23 @@ impl Parser {
     /// A parser at the start of a stream.
     #[must_use]
     pub const fn new() -> Self {
+        Self::with_seq(false)
+    }
+
+    /// A parser at the start of a stream, reading a JSON text sequence (`--seq`) if `seq`.
+    #[must_use]
+    pub const fn with_seq(seq: bool) -> Self {
         Self {
+            seq,
+            last_ch_was_ws: false,
             stack: Vec::new(),
             next: None,
             token: Vec::new(),
-            state: State::Normal,
+            state: if seq {
+                State::WaitingForRs
+            } else {
+                State::Normal
+            },
             line: 1,
             column: 0,
             bom: 0,
@@ -132,23 +161,52 @@ impl Parser {
             return Next::More;
         }
         if self.bom == BOM_MALFORMED {
-            return Next::Error("Malformed BOM".into());
+            if !self.seq {
+                return Next::Error("Malformed BOM".into());
+            }
+            // jq waits for an RS, though its reset takes it straight back to scanning.
+            self.state = State::WaitingForRs;
+            self.reset();
         }
         while self.pos < self.buf.len() {
             let ch = self.buf[self.pos];
             self.pos += 1;
+            if self.state == State::WaitingForRs {
+                if ch == b'\n' {
+                    self.line += 1;
+                    self.column = 0;
+                } else {
+                    self.column += 1;
+                }
+                if ch == RS {
+                    self.state = State::Normal;
+                }
+                continue;
+            }
             match self.scan(ch) {
-                Ok(None) => (),
-                Ok(Some(value)) => return Next::Value(value),
+                Ok(Step::Continue) => (),
+                Ok(Step::Value(value)) => return Next::Value(value),
+                Ok(Step::Stop) => return Next::More,
                 Err(message) => {
-                    let error =
-                        alloc::format!("{message} at line {}, column {}", self.line, self.column);
+                    let (line, column) = (self.line, self.column);
+                    if ch != RS && self.seq {
+                        // jq means to skip to the next RS, but its reset returns it to scanning.
+                        self.state = State::WaitingForRs;
+                        self.reset();
+                        return Next::Error(alloc::format!(
+                            "{message} at line {line}, column {column} (need RS to resync)"
+                        ));
+                    }
                     self.reset();
-                    // jq throws the rest of this buffer away.
-                    self.has_buf = false;
-                    self.buf.clear();
-                    self.pos = 0;
-                    return Next::Error(error);
+                    if !self.seq {
+                        // jq throws the rest of this buffer away.
+                        self.has_buf = false;
+                        self.buf.clear();
+                        self.pos = 0;
+                    }
+                    return Next::Error(alloc::format!(
+                        "{message} at line {line}, column {column}"
+                    ));
                 }
             }
         }
@@ -163,8 +221,15 @@ impl Parser {
                 parser.column
             );
             parser.reset();
+            parser.state = State::WaitingForRs;
             Next::Error(error)
         };
+        if self.state == State::WaitingForRs {
+            let (line, column) = (self.line, self.column);
+            return Next::Error(alloc::format!(
+                "Unfinished abandoned text at EOF at line {line}, column {column}"
+            ));
+        }
         if self.state != State::Normal {
             return at_eof(self, "Unfinished string");
         }
@@ -174,7 +239,14 @@ impl Parser {
         if !self.stack.is_empty() {
             return at_eof(self, "Unfinished JSON term");
         }
-        self.next.take().map_or(Next::More, Next::Value)
+        let value = self.next.take();
+        if self.seq && !self.last_ch_was_ws && matches!(value, Some(Val::Num(_))) {
+            let (line, column) = (self.line, self.column);
+            return Next::Error(alloc::format!(
+                "Potentially truncated top-level numeric value at EOF at line {line}, column {column}"
+            ));
+        }
+        value.map_or(Next::More, Next::Value)
     }
 
     fn reset(&mut self) {
@@ -185,17 +257,43 @@ impl Parser {
     }
 
     /// `scan`: one byte.
-    fn scan(&mut self, ch: u8) -> Result<Option<Val>, &'static str> {
+    fn scan(&mut self, ch: u8) -> Result<Step, &'static str> {
         self.column += 1;
         if ch == b'\n' {
             self.line += 1;
             self.column = 0;
         }
+        if self.seq && ch == RS {
+            // An RS ends the text before it, which must be complete.
+            let truncated = !self.last_ch_was_ws
+                && (!self.stack.is_empty()
+                    || !self.token.is_empty()
+                    || matches!(self.next, Some(Val::Num(_))));
+            if truncated {
+                let literal = self.check_literal();
+                if literal.is_ok()
+                    && self.stack.is_empty()
+                    && matches!(self.next, Some(Val::Num(_)))
+                {
+                    return Err("Potentially truncated top-level numeric value");
+                }
+                return Err("Truncated value");
+            }
+            self.check_literal()?;
+            if self.state == State::Normal {
+                if let Some(value) = self.check_done() {
+                    return Ok(Step::Value(value));
+                }
+            }
+            self.reset();
+            return Ok(Step::Stop);
+        }
+        self.last_ch_was_ws = false;
         if self.state != State::Normal {
             if ch == b'"' && self.state == State::Str {
                 self.found_string()?;
                 self.state = State::Normal;
-                return Ok(self.check_done());
+                return Ok(self.check_done().map_or(Step::Continue, Step::Value));
             }
             self.token.push(ch);
             self.state = if ch == b'\\' && self.state == State::Str {
@@ -203,7 +301,7 @@ impl Parser {
             } else {
                 State::Str
             };
-            return Ok(None);
+            return Ok(Step::Continue);
         }
         let literal = !matches!(
             ch,
@@ -211,8 +309,9 @@ impl Parser {
         );
         if literal {
             self.token.push(ch);
-            return Ok(None);
+            return Ok(Step::Continue);
         }
+        self.last_ch_was_ws = matches!(ch, b' ' | b'\t' | b'\r' | b'\n');
         self.check_literal()?;
         // jq takes a value finished here, but a failing structural character still wins.
         let mut done = self.check_done();
@@ -224,7 +323,7 @@ impl Parser {
         if let Some(value) = self.check_done() {
             done = Some(value);
         }
-        Ok(done)
+        Ok(done.map_or(Step::Continue, Step::Value))
     }
 
     /// `parse_check_done`: a complete top-level value.
@@ -492,11 +591,8 @@ pub fn number_literal(text: &[u8]) -> Option<Num> {
     }
     // The text is ASCII now.
     let text = core::str::from_utf8(text).ok()?;
-    Some(match Num::from_str(text) {
-        // decNumber keeps a negative zero's sign.
-        Num::Int(0) if negative => Num::Dec(String::from(text).into()),
-        n => n,
-    })
+    // A zero stays a decimal literal, keeping a negative zero's sign as decNumber does.
+    Some(Num::from_str(text))
 }
 
 /// Parse one JSON text as `jv_parse_sized` does, for `fromjson` and `--jsonargs`: exactly one
@@ -611,6 +707,48 @@ mod tests {
         ] {
             assert_eq!(show(bad), None, "{bad}");
         }
+    }
+
+    #[test]
+    fn seq_matches_jq() {
+        let seq = |input: &[u8]| {
+            let mut parser = Parser::with_seq(true);
+            parser.set_buf(input, false);
+            let mut out = Vec::new();
+            loop {
+                match parser.next_value() {
+                    Next::Value(value) => out.push(Ok(value.to_string())),
+                    Next::Error(error) => out.push(Err(error)),
+                    Next::More if parser.remaining() > 0 => (),
+                    Next::More => break,
+                }
+            }
+            out
+        };
+        assert_eq!(
+            seq(b"\x1e1\n\x1e[2]\n"),
+            vec![Ok("1".into()), Ok("[2]".into())]
+        );
+        assert_eq!(
+            seq(b"1\n"),
+            vec![Err(
+                "Unfinished abandoned text at EOF at line 2, column 0".into()
+            )]
+        );
+        assert_eq!(
+            seq(b"\x1e1\x1e2\n"),
+            vec![
+                Err("Potentially truncated top-level numeric value at line 1, column 3".into()),
+                Ok("2".into())
+            ]
+        );
+        assert_eq!(
+            seq(b"\x1e[1,}\n\x1e3\n"),
+            vec![
+                Err("Unmatched '}' at line 1, column 5 (need RS to resync)".into()),
+                Ok("3".into())
+            ]
+        );
     }
 
     #[test]

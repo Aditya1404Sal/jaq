@@ -375,3 +375,72 @@ yields!(
     r#"[-0,0.0,-0,0,"0"]"#
 );
 yields!(jq_rem_truncates, "[5.5 % 2, 5 % 2.5, 1e30 % 7]", [1, 1, 0]);
+
+// jq 1.8 numbers: a computed zero negates to -0, a literal one to 0.
+yields!(
+    jq_zero_negation,
+    "[((1-1) | -.), -(0), ([] | length | -.), (0 | -.)] | tojson",
+    "[-0,0,-0,0]"
+);
+yields!(
+    jq_string_repeat,
+    r#"["ab" * 0, "ab" * 1.5, "ab" * -1] | tojson"#,
+    r#"["","ab",null]"#
+);
+
+// jq 1.8's error wording.
+yields!(
+    jq_iterate_error,
+    "1 | try .[] catch .",
+    "Cannot iterate over number (1)"
+);
+yields!(
+    jq_add_error,
+    "try ({} + 1) catch .",
+    "object ({}) and number (1) cannot be added"
+);
+yields!(
+    jq_negate_error,
+    r#"try (-"a") catch ."#,
+    "string (\"a\") cannot be negated"
+);
+yields!(
+    jq_keys_error,
+    "1 | try keys catch .",
+    "number (1) has no keys"
+);
+yields!(
+    jq_has_error,
+    r#"{} | try has(0) catch ."#,
+    "Cannot check whether object has a number key"
+);
+yields!(
+    jq_contains_kinds,
+    "true | try contains(false) catch .",
+    "boolean (true) and boolean (false) cannot have their containment checked"
+);
+yields!(
+    jq_object_key_error,
+    "1 | try {(.): 2} catch .",
+    "Cannot use number (1) as object key"
+);
+yields!(
+    jq_slice_bounds,
+    "[1,2,3] | [.[1.5:], .[:1.5]] | tojson",
+    "[[2,3],[1,2]]"
+);
+yields!(
+    jq_loc,
+    "$__loc__ | tojson",
+    r#"{"file":"<top-level>","line":1}"#
+);
+yields!(
+    jq_lgamma_r,
+    "[-0.5 | lgamma_r] | tojson",
+    "[[1.2655121234846454,-1]]"
+);
+yields!(
+    jq_delpaths_missing,
+    "{} | delpaths([[\"a\",0]]) | tojson",
+    "{}"
+);

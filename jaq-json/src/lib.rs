@@ -25,9 +25,7 @@ use core::cmp::Ordering;
 use core::fmt;
 use core::hash::{Hash, Hasher};
 use jaq_core::box_iter::box_once;
-use jaq_core::{load, ops, path, val, Exn};
-use num_bigint::BigInt;
-use num_traits::{cast::ToPrimitive, Signed};
+use jaq_core::{load, path, val, Exn};
 
 pub use funs::{bytes_valrs, funs};
 pub use num::Num;
@@ -82,34 +80,17 @@ const _: () = {
 /// Types and sets of types.
 #[derive(Clone, Debug, PartialEq, Eq)]
 enum Type {
-    /// `[] | .["a"]` or `limit("a"; 0)` or `range(0; "a")`
-    Int,
-    /*
-    /// `"1" | sin` or `pow(2; "3")` or `fma(2; 3; "4")`
-    Float,
-    */
-    /// `-"a"`, `"a" | round`
-    Num,
-    /// `{(0): 1}` or `0 | fromjson` or `0 | explode` or `"a b c" | split(0)`
+    /// `0 | fromjson` or `"a b c" | split(0)`
     Str,
-    /// `0 | sort` or `0 | implode` or `[] | .[0:] = 0`
+    /// `0 | implode`
     Arr,
-    /// `0 | .[]` or `0 | .[0]` or `0 | keys` (array or object)
-    Iter,
-    /// `{}[0:1]` (string or array)
-    Range,
 }
 
 impl Type {
     fn as_str(&self) -> &'static str {
         match self {
-            Self::Int => "integer",
-            //Self::Float => "floating-point number",
-            Self::Num => "number",
             Self::Str => "string",
             Self::Arr => "array",
-            Self::Iter => "iterable (array or object)",
-            Self::Range => "rangeable (array or string)",
         }
     }
 }
@@ -117,7 +98,7 @@ impl Type {
 /// A value's own jq type name (`type`'s own vocabulary: `null`/`boolean`/`number`/`string`/
 /// `array`/`object`), as opposed to [`Type`] above, which names a *target* type a value failed
 /// to convert to.
-fn type_name(v: &Val) -> &'static str {
+pub(crate) fn type_name(v: &Val) -> &'static str {
     match v {
         Val::Null => "null",
         Val::Bool(_) => "boolean",
@@ -160,6 +141,17 @@ pub(crate) fn type_error(v: &Val, message: &str) -> Error {
         "{} ({}) {message}",
         type_name(v),
         dump_trunc(v)
+    ))
+}
+
+/// jq's `type_error2`: `KIND (VALUE) and KIND (VALUE) MESSAGE`.
+pub(crate) fn type_error2(l: &Val, r: &Val, message: &str) -> Error {
+    Error::str(format_args!(
+        "{} ({}) and {} ({}) {message}",
+        type_name(l),
+        dump_trunc(l),
+        type_name(r),
+        dump_trunc(r)
     ))
 }
 
@@ -213,7 +205,19 @@ impl jaq_core::ValT for Val {
     }
 
     fn from_map<I: IntoIterator<Item = (Self, Self)>>(iter: I) -> ValR {
-        Ok(Self::obj(iter.into_iter().collect()))
+        let mut map = Map::default();
+        for (k, v) in iter {
+            // jq builds objects with string keys only.
+            if !matches!(k, Val::TStr(_) | Val::BStr(_)) {
+                return Err(Error::str(format_args!(
+                    "Cannot use {} ({}) as object key",
+                    type_name(&k),
+                    dump_trunc(&k)
+                )));
+            }
+            map.insert(k, v);
+        }
+        Ok(Self::obj(map))
     }
 
     fn key_values(self) -> Box<dyn Iterator<Item = Result<(Val, Val), Error>>> {
@@ -221,7 +225,7 @@ impl jaq_core::ValT for Val {
         match self {
             Self::Arr(a) => Box::new(rc_unwrap_or_clone(a).into_iter().enumerate().map(arr_idx)),
             Self::Obj(o) => Box::new(rc_unwrap_or_clone(o).into_iter().map(Ok)),
-            _ => box_once(Err(Error::typ(self, Type::Iter.as_str()))),
+            _ => box_once(Err(jaq_core::ValT::iterate_error(&self))),
         }
     }
 
@@ -229,7 +233,7 @@ impl jaq_core::ValT for Val {
         match self {
             Self::Arr(a) => Box::new(rc_unwrap_or_clone(a).into_iter().map(Ok)),
             Self::Obj(o) => Box::new(rc_unwrap_or_clone(o).into_iter().map(|(_k, v)| Ok(v))),
-            _ => box_once(Err(Error::typ(self, Type::Iter.as_str()))),
+            _ => box_once(Err(jaq_core::ValT::iterate_error(&self))),
         }
     }
 
@@ -243,17 +247,14 @@ impl jaq_core::ValT for Val {
             return Ok(Val::Null);
         }
         let fs = |b: Bytes, range, skip_take: SkipTakeFn| {
-            Self::range_int(range)
-                .map(|range_char| skip_take(range_char, &b))
-                .map(|(skip, take)| b.slice(skip..skip + take))
+            skip_take(range, &b).map(|(skip, take)| b.slice(skip..skip + take))
         };
         match self {
             Val::BStr(b) => fs(*b, range, skip_take_bytes).map(Val::byte_str),
             Val::TStr(b) => fs(*b, range, skip_take_chars).map(Val::utf8_str),
-            Val::Arr(a) => Self::range_int(range)
-                .map(|range| skip_take(range, a.len()))
+            Val::Arr(a) => slice_bounds(range, a.len())
                 .map(|(skip, take)| a.iter().skip(skip).take(take).cloned().collect()),
-            _ => Err(Error::typ(self, Type::Range.as_str())),
+            _ => Err(index_type_error(&self, &slice_object(range))),
         }
     }
 
@@ -272,7 +273,7 @@ impl jaq_core::ValT for Val {
                 let iter = iter.filter_map(|(k, v)| f(v).next().map(|v| Ok((k, v?))));
                 Ok(Self::obj(iter.collect::<Result<_, Exn<_>>>()?))
             }
-            v => opt.fail(v, |v| Exn::from(Error::typ(v, Type::Iter.as_str()))),
+            v => opt.fail(v, |v| Exn::from(jaq_core::ValT::iterate_error(&v))),
         }
     }
 
@@ -290,9 +291,13 @@ impl jaq_core::ValT for Val {
             // jq treats null as an empty object or array when updating it by key or index.
             Val::Null => match index {
                 Val::TStr(_) | Val::BStr(_) => Val::obj(Map::default()).map_index(index, opt, f),
-                Val::Num(n) if n.is_int() => Val::Arr(Rc::new(Vec::new())).map_index(index, opt, f),
-                _ => opt.fail(self, |v| Exn::from(Error::typ(v, Type::Iter.as_str()))),
+                Val::Num(_) => Val::Arr(Rc::new(Vec::new())).map_index(index, opt, f),
+                _ => opt.fail(self, |v| Exn::from(index_type_error(&v, index))),
             },
+            // jq reads the field first, and only a string names an object's field.
+            Val::Obj(_) if !matches!(index, Val::TStr(_) | Val::BStr(_)) => {
+                opt.fail(self, |v| Exn::from(index_type_error(&v, index)))
+            }
             Val::Obj(ref mut o) => {
                 use indexmap::map::Entry::{Occupied, Vacant};
                 match Rc::make_mut(o).entry(index.clone()) {
@@ -313,15 +318,32 @@ impl jaq_core::ValT for Val {
                 }
                 Ok(self)
             }
+            Val::Arr(_) if !matches!(index, Val::Num(_)) => {
+                opt.fail(self, |v| Exn::from(index_type_error(&v, index)))
+            }
             Val::Arr(ref mut a) => {
                 let oob = || Error::str("Out of bounds negative array index");
                 let len = a.len();
-                // Like jq, a non-negative index past the end extends the array with nulls.
+                // As jq's `jv_set`: the index truncated to an integer (NaN refused), and a
+                // non-negative index past the end extends the array with nulls.
+                let i = match index {
+                    Val::Num(n) if n.as_f64().is_nan() => {
+                        let e = Error::str("Cannot set array element at NaN index");
+                        return opt.fail(self, |_| Exn::from(e));
+                    }
+                    Val::Num(n) => {
+                        let d = n.as_f64().clamp(f64::from(i32::MIN), f64::from(i32::MAX));
+                        #[allow(clippy::cast_possible_truncation)]
+                        let i = d as isize;
+                        num::PosUsize(i >= 0, i.unsigned_abs())
+                    }
+                    _ => num::PosUsize(true, 0),
+                };
                 let abs_or = |i: num::PosUsize| match i {
                     num::PosUsize(true, i) => Ok(i),
                     i => abs_index(i, len).ok_or_else(oob),
                 };
-                let i = match index.as_pos_usize().and_then(abs_or) {
+                let i = match abs_or(i) {
                     Ok(i) => i,
                     Err(e) => return opt.fail(self, |_| Exn::from(e)),
                 };
@@ -331,10 +353,19 @@ impl jaq_core::ValT for Val {
                     let e = Error::str("Array index too large");
                     return opt.fail(self, |_| Exn::from(e));
                 }
-                let a = Rc::make_mut(a);
+                // Deleting past the end leaves the array as it is.
                 if i >= a.len() {
-                    a.resize(i + 1, Val::Null);
+                    match f(Val::Null).next().transpose()? {
+                        None => return Ok(self),
+                        Some(y) => {
+                            let a = Rc::make_mut(a);
+                            a.resize(i, Val::Null);
+                            a.push(y);
+                            return Ok(self);
+                        }
+                    }
                 }
+                let a = Rc::make_mut(a);
                 let x = core::mem::take(&mut a[i]);
                 if let Some(y) = f(x).next().transpose()? {
                     a[i] = y;
@@ -343,7 +374,7 @@ impl jaq_core::ValT for Val {
                 }
                 Ok(self)
             }
-            _ => opt.fail(self, |v| Exn::from(Error::typ(v, Type::Iter.as_str()))),
+            _ => opt.fail(self, |v| Exn::from(index_type_error(&v, index))),
         }
     }
 
@@ -354,8 +385,8 @@ impl jaq_core::ValT for Val {
         f: impl Fn(Self) -> I,
     ) -> ValX<'a> {
         let fs = |b: Bytes, range, skip_take: SkipTakeFn, from: ValBytesFn, into: BytesValFn| {
-            let (skip, take) = match Self::range_int(range) {
-                Ok(range) => skip_take(range, &b),
+            let (skip, take) = match skip_take(range, &b) {
+                Ok(bounds) => bounds,
                 Err(e) => return opt.fail(into(b), |_| Exn::from(e)),
             };
             let str = into(b.slice(skip..skip + take));
@@ -369,8 +400,8 @@ impl jaq_core::ValT for Val {
         let stc = skip_take_chars;
         match self {
             Val::Arr(ref mut a) => {
-                let (skip, take) = match Self::range_int(range) {
-                    Ok(range) => skip_take(range, a.len()),
+                let (skip, take) = match slice_bounds(range, a.len()) {
+                    Ok(bounds) => bounds,
                     Err(e) => return opt.fail(self, |_| Exn::from(e)),
                 };
                 let arr = a.iter().skip(skip).take(take).cloned().collect();
@@ -381,7 +412,10 @@ impl jaq_core::ValT for Val {
             }
             Val::BStr(b) => fs(*b, range, stb, Val::into_byte_str, Val::byte_str),
             Val::TStr(b) => fs(*b, range, stc, Val::into_utf8_str, Val::utf8_str),
-            _ => opt.fail(self, |v| Exn::from(Error::typ(v, Type::Arr.as_str()))),
+            _ => {
+                let slice = slice_object(range);
+                opt.fail(self, |v| Exn::from(index_type_error(&v, &slice)))
+            }
         }
     }
 
@@ -395,6 +429,14 @@ impl jaq_core::ValT for Val {
             Self::BStr(b) | Self::TStr(b) => Self::TStr(b),
             _ => Self::utf8_str(self.to_json()),
         }
+    }
+
+    fn kind_name(&self) -> &'static str {
+        type_name(self)
+    }
+
+    fn dump_trunc(&self) -> String {
+        dump_trunc(self)
     }
 }
 
@@ -443,10 +485,6 @@ impl jaq_std::ValT for Val {
     fn from_utf8_bytes(b: impl AsRef<[u8]> + Send + 'static) -> Self {
         Self::utf8_str(Bytes::from_owner(b))
     }
-
-    fn type_error(&self, message: &str) -> Error {
-        type_error(self, message)
-    }
 }
 
 /// Definitions of the standard library.
@@ -458,30 +496,70 @@ pub fn defs() -> impl Iterator<Item = load::parse::Def<&'static str>> {
 
 type ValBytesFn = fn(Val) -> Result<Bytes, Error>;
 type BytesValFn = fn(Bytes) -> Val;
-type SkipTakeFn = fn(val::Range<num::PosUsize>, &[u8]) -> (usize, usize);
+type SkipTakeFn = fn(val::Range<&Val>, &[u8]) -> Result<(usize, usize), Error>;
 
-fn skip_take(range: val::Range<num::PosUsize>, len: usize) -> (usize, usize) {
-    let from = abs_bound(range.start, len, 0);
-    let upto = abs_bound(range.end, len, len);
-    (from, upto.saturating_sub(from))
-}
-
-fn skip_take_bytes(range: val::Range<num::PosUsize>, b: &[u8]) -> (usize, usize) {
-    skip_take(range, b.len())
-}
-
-fn skip_take_chars(range: val::Range<num::PosUsize>, b: &[u8]) -> (usize, usize) {
-    let byte_index = |num::PosUsize(pos, c)| {
-        let mut chars = b.char_indices().map(|(start, ..)| start);
-        if pos {
-            chars.nth(c).unwrap_or(b.len())
-        } else {
-            chars.nth_back(c - 1).unwrap_or(0)
-        }
+/// jq's `parse_slice`: where a slice of `len` elements starts and how many it takes. The bounds
+/// are numbers (or null for the ends); a negative one counts from the end, the start is rounded
+/// down and the end up, and both are clamped to the elements.
+fn slice_bounds(range: val::Range<&Val>, len: usize) -> Result<(usize, usize), Error> {
+    let bound = |bound: Option<&Val>, default: f64| match bound {
+        None | Some(Val::Null) => Ok(default),
+        Some(Val::Num(n)) => Ok(n.as_f64()),
+        Some(_) => Err(Error::str("Array/string slice indices must be integers")),
     };
-    let from_byte = range.start.map_or(0, byte_index);
-    let upto_byte = range.end.map_or(b.len(), byte_index);
-    (from_byte, upto_byte.saturating_sub(from_byte))
+    #[allow(clippy::cast_precision_loss)]
+    let flen = len as f64;
+    let mut dstart = bound(range.start, 0.0)?;
+    let mut dend = bound(range.end, flen)?;
+    if dstart.is_nan() {
+        dstart = 0.0;
+    }
+    if dstart < 0.0 {
+        dstart += flen;
+    }
+    let dstart = dstart.clamp(0.0, flen);
+    #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+    let start = dstart as usize;
+    if dend.is_nan() {
+        dend = flen;
+    }
+    if dend < 0.0 {
+        dend += flen;
+    }
+    if dend < 0.0 {
+        #[allow(clippy::cast_precision_loss)]
+        let start = start as f64;
+        dend = start;
+    }
+    #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+    let mut end = (dend.min(f64::from(i32::MAX)) as usize).min(len);
+    #[allow(clippy::cast_precision_loss)]
+    if end < len && (end as f64) < dend {
+        end += 1;
+    }
+    let end = end.max(start);
+    Ok((start, end - start))
+}
+
+/// The object jq indexes by for a slice: `{"start": ..., "end": ...}`.
+fn slice_object(range: val::Range<&Val>) -> Val {
+    let bound = |b: Option<&Val>| b.cloned().unwrap_or(Val::Null);
+    Val::obj(Map::from_iter([
+        (Val::utf8_str("start"), bound(range.start)),
+        (Val::utf8_str("end"), bound(range.end)),
+    ]))
+}
+
+fn skip_take_bytes(range: val::Range<&Val>, b: &[u8]) -> Result<(usize, usize), Error> {
+    slice_bounds(range, b.len())
+}
+
+fn skip_take_chars(range: val::Range<&Val>, b: &[u8]) -> Result<(usize, usize), Error> {
+    let (skip, take) = slice_bounds(range, b.chars().count())?;
+    let byte_index = |c: usize| b.char_indices().nth(c).map_or(b.len(), |(i, ..)| i);
+    let from = byte_index(skip);
+    let upto = byte_index(skip + take);
+    Ok((from, upto - from))
 }
 
 fn bytes_splice(b: &mut BytesMut, skip: usize, take: usize, replace: &[u8]) {
@@ -500,10 +578,6 @@ fn bytes_splice(b: &mut BytesMut, skip: usize, take: usize, replace: &[u8]) {
 
 /// If a range bound is given, absolutise and clip it between 0 and `len`,
 /// else return `default`.
-fn abs_bound(i: Option<num::PosUsize>, len: usize, default: usize) -> usize {
-    i.map_or(default, |i| core::cmp::min(i.wrap(len).unwrap_or(0), len))
-}
-
 /// Absolutise an index and return result if it is inside [0, len).
 fn abs_index(i: num::PosUsize, len: usize) -> Option<usize> {
     i.wrap(len).filter(|i| *i < len)
@@ -530,12 +604,6 @@ impl Val {
             Self::Num(n) => Some(n),
             _ => None,
         }
-    }
-
-    /// If the value is an integer in [-usize::MAX, +usize::MAX], return it, else fail.
-    fn as_pos_usize(&self) -> Result<num::PosUsize, Error> {
-        let fail = || Error::typ(self.clone(), Type::Int.as_str());
-        self.as_num().and_then(Num::as_pos_usize).ok_or_else(fail)
     }
 
     fn into_byte_str(self) -> Result<Bytes, Error> {
@@ -565,16 +633,6 @@ impl Val {
             Self::Arr(a) => Ok(a),
             _ => Err(Error::typ(self.clone(), Type::Arr.as_str())),
         }
-    }
-
-    fn range_int(range: val::Range<&Self>) -> Result<val::Range<num::PosUsize>, Error> {
-        let f = |i: Option<&Self>| {
-            i.as_ref()
-                .filter(|i| !matches!(i, Val::Null))
-                .map(|i| i.as_pos_usize())
-                .transpose()
-        };
-        Ok(f(range.start)?..f(range.end)?)
     }
 
     fn to_json(&self) -> Vec<u8> {
@@ -660,12 +718,6 @@ impl FromIterator<Self> for Val {
     }
 }
 
-fn bigint_to_int_saturated(i: &BigInt) -> isize {
-    let (min, max) = (isize::MIN, isize::MAX);
-    i.to_isize()
-        .unwrap_or_else(|| if i.is_negative() { min } else { max })
-}
-
 impl core::ops::Add for Val {
     type Output = ValR;
     fn add(self, rhs: Self) -> Self::Output {
@@ -690,7 +742,7 @@ impl core::ops::Add for Val {
                 Rc::make_mut(&mut l).extend(r.iter().map(|(k, v)| (k.clone(), v.clone())));
                 Ok(Obj(l))
             }
-            (l, r) => Err(Error::math(l, ops::Math::Add, r)),
+            (l, r) => Err(type_error2(&l, &r, "cannot be added")),
         }
     }
 }
@@ -705,7 +757,7 @@ impl core::ops::Sub for Val {
                 Rc::make_mut(&mut l).retain(|x| !r.contains(x));
                 Ok(Self::Arr(l))
             }
-            (l, r) => Err(Error::math(l, ops::Math::Sub, r)),
+            (l, r) => Err(type_error2(&l, &r, "cannot be subtracted")),
         }
     }
 }
@@ -734,40 +786,55 @@ fn obj_merge(l: &mut Rc<Map>, r: Rc<Map>) {
 /// own `INT_MAX` bound is not actually reachable here.
 const MAX_REPEATED_STRING_LEN: usize = 16 * 1024 * 1024;
 
-fn checked_repeat_len(part_len: usize, count: isize) -> Result<usize, Error> {
+fn checked_repeat_len(part_len: usize, count: usize) -> Result<usize, Error> {
     part_len
-        .checked_mul(count as usize)
+        .checked_mul(count)
         .filter(|&len| len <= MAX_REPEATED_STRING_LEN)
         .ok_or_else(|| Error::str("Repeat string result too long"))
+}
+
+/// How many times jq 1.8 repeats a string multiplied by `n`: `None` (giving `null`) for a
+/// negative count or NaN, else the count truncated to an integer, `0` giving `""`.
+fn repeat_count(n: &Num) -> Option<usize> {
+    let d = n.as_f64();
+    if d < 0.0 || d.is_nan() {
+        return None;
+    }
+    #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+    Some(if d > f64::from(i32::MAX) {
+        i32::MAX as usize
+    } else {
+        d as usize
+    })
 }
 
 impl core::ops::Mul for Val {
     type Output = ValR;
     fn mul(self, rhs: Self) -> Self::Output {
-        use crate::Num::{BigInt, Int};
         use Val::*;
         match (self, rhs) {
             (Num(x), Num(y)) => Ok(Num(x * y)),
-            (s @ (BStr(_) | TStr(_)), Num(BigInt(i)))
-            | (Num(BigInt(i)), s @ (BStr(_) | TStr(_))) => {
-                s * Num(Int(bigint_to_int_saturated(&i)))
-            }
-            (BStr(s), Num(Int(i))) | (Num(Int(i)), BStr(s)) if i > 0 => {
-                checked_repeat_len(s.len(), i)?;
-                Ok(Self::byte_str(s.repeat(i as usize)))
-            }
-            (TStr(s), Num(Int(i))) | (Num(Int(i)), TStr(s)) if i > 0 => {
-                checked_repeat_len(s.len(), i)?;
-                Ok(Self::utf8_str(s.repeat(i as usize)))
-            }
-            // string multiplication with negatives or 0 results in null
-            // <https://jqlang.github.io/jq/manual/#Builtinoperatorsandfunctions>
-            (BStr(_) | TStr(_), Num(Int(_))) | (Num(Int(_)), BStr(_) | TStr(_)) => Ok(Null),
+            // As jq 1.8 repeats: `"ab" * 1.5` is `"ab"`, `"ab" * 0` is `""` and a negative
+            // count gives `null`.
+            (BStr(s), Num(n)) | (Num(n), BStr(s)) => Ok(match repeat_count(&n) {
+                None => Null,
+                Some(count) => {
+                    checked_repeat_len(s.len(), count)?;
+                    Self::byte_str(s.repeat(count))
+                }
+            }),
+            (TStr(s), Num(n)) | (Num(n), TStr(s)) => Ok(match repeat_count(&n) {
+                None => Null,
+                Some(count) => {
+                    checked_repeat_len(s.len(), count)?;
+                    Self::utf8_str(s.repeat(count))
+                }
+            }),
             (Obj(mut l), Obj(r)) => {
                 obj_merge(&mut l, r);
                 Ok(Obj(l))
             }
-            (l, r) => Err(Error::math(l, ops::Math::Mul, r)),
+            (l, r) => Err(type_error2(&l, &r, "cannot be multiplied")),
         }
     }
 }
@@ -814,7 +881,7 @@ impl core::ops::Div for Val {
             (Self::Num(x), Self::Num(y)) => Ok(Self::Num(x / y)),
             (Self::TStr(x), Self::TStr(y)) => Ok(fs(*x, *y, Val::utf8_str)),
             (Self::BStr(x), Self::BStr(y)) => Ok(fs(*x, *y, Val::byte_str)),
-            (l, r) => Err(Error::math(l, ops::Math::Div, r)),
+            (l, r) => Err(type_error2(&l, &r, "cannot be divided")),
         }
     }
 }
@@ -827,7 +894,7 @@ impl core::ops::Rem for Val {
                 Err(zero_divisor_error(x, y, true))
             }
             (Self::Num(x), Self::Num(y)) => Ok(Self::Num(x % y)),
-            (l, r) => Err(Error::math(l, ops::Math::Rem, r)),
+            (l, r) => Err(type_error2(&l, &r, "cannot be divided (remainder)")),
         }
     }
 }
@@ -837,7 +904,7 @@ impl core::ops::Neg for Val {
     fn neg(self) -> Self::Output {
         match self {
             Self::Num(n) => Ok(Self::Num(-n)),
-            x => Err(Error::typ(x, Type::Num.as_str())),
+            x => Err(type_error(&x, "cannot be negated")),
         }
     }
 }

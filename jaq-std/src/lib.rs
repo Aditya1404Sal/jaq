@@ -150,11 +150,6 @@ pub trait ValT: jaq_core::ValT + Ord + From<f64> + From<usize> {
 
     /// Interpret bytes as UTF-8 string value.
     fn from_utf8_bytes(b: impl AsRef<[u8]> + Send + 'static) -> Self;
-
-    /// An error about this value, as jq's `type_error` words it: `TYPE (VALUE) MESSAGE`.
-    fn type_error(&self, message: &str) -> Error<Self> {
-        Error::str(format_args!("{self} {message}"))
-    }
 }
 
 /// Convenience trait for implementing the core functions.
@@ -172,25 +167,54 @@ trait ValTx: ValT + Sized {
         self.try_as_isize()?.try_into().map_err(Error::str)
     }
 
+    /// The value as a number; jq's math functions refuse anything else as below.
     fn try_as_f64(&self) -> Result<f64, Error<Self>> {
         self.as_f64()
-            .ok_or_else(|| Error::typ(self.clone(), "number"))
+            .ok_or_else(|| self.type_error("number required"))
+    }
+
+    /// jq's `type_error2`: `KIND (VALUE) and KIND (VALUE) MESSAGE`.
+    fn type_error2(&self, other: &Self, message: &str) -> Error<Self> {
+        Error::str(format_args!(
+            "{} ({}) and {} ({}) {message}",
+            self.kind_name(),
+            self.dump_trunc(),
+            other.kind_name(),
+            other.dump_trunc()
+        ))
+    }
+
+    /// The string bytes of this value, or the error `message`.
+    fn str_or(&self, message: &str) -> Result<&[u8], Error<Self>> {
+        self.as_utf8_bytes().ok_or_else(|| Error::str(message))
+    }
+
+    /// The elements of an array to sort or pick from by `f`, as jq gets them with `map([f])`:
+    /// anything but an array or object cannot be iterated over, and an object's mapped values
+    /// are no array to go with it (`MESSAGE`).
+    fn by_elements<'a>(
+        self,
+        f: &impl Fn(Self) -> ValXs<'a, Self>,
+        message: &str,
+    ) -> Result<Vec<Self>, Exn<'a, Self>> {
+        match self.into_seq() {
+            Ok(xs) => Ok(xs),
+            Err(v) if v.kind_name() == "object" => {
+                let keys = v
+                    .clone()
+                    .values()
+                    .map(|x| f(x?).collect::<Result<Self, _>>());
+                let keys = keys.collect::<Result<Self, _>>()?;
+                Err(Exn::from(v.type_error2(&keys, message)))
+            }
+            Err(v) => Err(Exn::from(v.iterate_error())),
+        }
     }
 
     /// Apply a function to an array.
     fn mutate_arr(self, f: impl FnOnce(&mut Vec<Self>)) -> ValR<Self> {
         let mut a = self.into_vec()?;
         f(&mut a);
-        Ok(Self::from_iter(a))
-    }
-
-    /// Apply a function to an array.
-    fn try_mutate_arr<'a, F>(self, f: F) -> ValX<'a, Self>
-    where
-        F: FnOnce(&mut Vec<Self>) -> Result<(), Exn<'a, Self>>,
-    {
-        let mut a = self.into_vec()?;
-        f(&mut a)?;
         Ok(Self::from_iter(a))
     }
 
@@ -224,10 +248,6 @@ trait ValTx: ValT + Sized {
         B: AsRef<[u8]> + Send + 'static,
     {
         Ok(Self::from_utf8_bytes(f(self.try_as_utf8_bytes()?)))
-    }
-
-    fn trim_utf8_with(&self, f: impl FnOnce(&[u8]) -> &[u8]) -> ValR<Self> {
-        Ok(self.as_sub_str(f(self.try_as_utf8_bytes()?)))
     }
 
     /// Helper function to strip away the prefix or suffix of a string.
@@ -378,6 +398,22 @@ fn implode<V: ValT>(v: V) -> Result<Vec<u8>, Error<V>> {
     Ok(s.into_bytes())
 }
 
+/// jq's `trim`, `ltrim` and `rtrim`.
+fn trim_with<V: ValT>(v: &V, f: impl FnOnce(&[u8]) -> &[u8]) -> ValR<V> {
+    let s = v.str_or("trim input must be a string")?;
+    Ok(v.as_sub_str(f(s)))
+}
+
+/// jq's `min` and `max` (`minmax_by` with each element its own key), without the `null` that
+/// an empty array gives (see `defs.jq`).
+fn min_max<'a, V: ValT + 'a>(v: V, replace: fn(&[V], &[V]) -> bool) -> ValXs<'a, V> {
+    let xs: Vec<V> = match v.into_seq() {
+        Ok(xs) => xs,
+        Err(v) => return box_once(Err(Exn::from(v.type_error2(&v, "cannot be iterated over")))),
+    };
+    once_or_empty(cmp_by(xs, |x| box_once(Ok(x)), replace))
+}
+
 fn once_or_empty<'a, T: 'a, E: 'a>(r: Result<Option<T>, E>) -> BoxIter<'a, Result<T, E>> {
     Box::new(r.transpose().into_iter())
 }
@@ -504,72 +540,105 @@ where
         ("round", v(0), |cv| bome(cv.1.round(round))),
         ("ceil", v(0), |cv| bome(cv.1.round(ceil))),
         ("utf8bytelength", v(0), |cv| {
-            bome(cv.1.try_as_utf8_bytes().map(|s| (s.len() as isize).into()))
+            let message = "only strings have UTF-8 byte length";
+            let len = cv.1.as_utf8_bytes().ok_or_else(|| cv.1.type_error(message));
+            bome(len.map(|s| (s.len() as isize).into()))
         }),
         ("explode", v(0), |cv| {
-            bome(cv.1.try_as_utf8_bytes().and_then(|s| explode(s).collect()))
+            let s = cv.1.str_or("explode input must be a string");
+            bome(s.and_then(|s| explode(s).collect()))
         }),
         ("implode", v(0), |cv| {
             bome(implode(cv.1).map(D::V::from_utf8_bytes))
         }),
         ("ascii_downcase", v(0), |cv| {
-            bome(cv.1.map_utf8_str(ByteSlice::to_ascii_lowercase))
+            let s = cv.1.str_or("explode input must be a string");
+            bome(s.map(|s| D::V::from_utf8_bytes(s.to_ascii_lowercase())))
         }),
         ("ascii_upcase", v(0), |cv| {
-            bome(cv.1.map_utf8_str(ByteSlice::to_ascii_uppercase))
+            let s = cv.1.str_or("explode input must be a string");
+            bome(s.map(|s| D::V::from_utf8_bytes(s.to_ascii_uppercase())))
         }),
         ("reverse", v(0), |cv| bome(cv.1.mutate_arr(|a| a.reverse()))),
-        ("sort", v(0), |cv| bome(cv.1.mutate_arr(|a| a.sort()))),
+        ("sort", v(0), |cv| {
+            bome(match cv.1.into_seq::<Vec<_>>() {
+                Ok(mut a) => {
+                    a.sort();
+                    Ok(D::V::from_iter(a))
+                }
+                Err(v) => Err(v.type_error("cannot be sorted, as it is not an array")),
+            })
+        }),
         ("sort_by", f(), |mut cv| {
             let (f, fc) = cv.0.pop_fun();
             let f = move |v| f.run((fc.clone(), v));
-            box_once(cv.1.try_mutate_arr(|a| sort_by(a, f)))
+            let message = "cannot be sorted, as they are not both arrays";
+            box_once(cv.1.by_elements(&f, message).and_then(|mut a| {
+                sort_by(&mut a, f)?;
+                Ok(D::V::from_iter(a))
+            }))
         }),
         ("group_by", f(), |mut cv| {
             let (f, fc) = cv.0.pop_fun();
             let f = move |v| f.run((fc.clone(), v));
-            box_once((|| group_by(cv.1.into_vec()?, f))())
+            let message = "cannot be sorted, as they are not both arrays";
+            box_once(cv.1.by_elements(&f, message).and_then(|a| group_by(a, f)))
         }),
         ("min_by_or_empty", f(), |mut cv| {
             let (f, fc) = cv.0.pop_fun();
-            let f = move |a| cmp_by(a, |v| f.run((fc.clone(), v)), |my, y| y < my);
-            once_or_empty(cv.1.into_vec().map_err(Exn::from).and_then(f))
+            let f = move |v| f.run((fc.clone(), v));
+            let a = cv.1.by_elements(&f, "cannot be iterated over");
+            once_or_empty(a.and_then(|a| cmp_by(a, f, |my, y| y < my)))
         }),
         ("max_by_or_empty", f(), |mut cv| {
             let (f, fc) = cv.0.pop_fun();
-            let f = move |a| cmp_by(a, |v| f.run((fc.clone(), v)), |my, y| y >= my);
-            once_or_empty(cv.1.into_vec().map_err(Exn::from).and_then(f))
+            let f = move |v| f.run((fc.clone(), v));
+            let a = cv.1.by_elements(&f, "cannot be iterated over");
+            once_or_empty(a.and_then(|a| cmp_by(a, f, |my, y| y >= my)))
         }),
+        // jq's C `min` and `max`.
+        ("min_or_empty", v(0), |cv| min_max(cv.1, |my, y| y < my)),
+        ("max_or_empty", v(0), |cv| min_max(cv.1, |my, y| y >= my)),
         ("startswith", v(1), |cv| {
-            unary(cv, |v, s| {
-                Ok(v.try_as_bytes()?.starts_with(s.try_as_bytes()?).into())
+            unary(cv, |v, s| match (v.as_utf8_bytes(), s.as_utf8_bytes()) {
+                (Some(v), Some(s)) => Ok(v.starts_with(s).into()),
+                _ => Err(Error::str("startswith() requires string inputs")),
             })
         }),
         ("endswith", v(1), |cv| {
-            unary(cv, |v, s| {
-                Ok(v.try_as_bytes()?.ends_with(s.try_as_bytes()?).into())
+            unary(cv, |v, s| match (v.as_utf8_bytes(), s.as_utf8_bytes()) {
+                (Some(v), Some(s)) => Ok(v.ends_with(s).into()),
+                _ => Err(Error::str("endswith() requires string inputs")),
             })
         }),
+        // jq 1.8 trims through `startswith`/`endswith`, so only strings trim.
         ("ltrimstr", v(1), |cv| {
-            unary(cv, |v, pre| v.strip_fix(&pre, <[u8]>::strip_prefix))
+            unary(cv, |v, pre| {
+                if v.as_utf8_bytes().is_none() || pre.as_utf8_bytes().is_none() {
+                    return Err(Error::str("startswith() requires string inputs"));
+                }
+                v.strip_fix(&pre, <[u8]>::strip_prefix)
+            })
         }),
         ("rtrimstr", v(1), |cv| {
-            unary(cv, |v, suf| v.strip_fix(&suf, <[u8]>::strip_suffix))
+            unary(cv, |v, suf| {
+                if v.as_utf8_bytes().is_none() || suf.as_utf8_bytes().is_none() {
+                    return Err(Error::str("endswith() requires string inputs"));
+                }
+                v.strip_fix(&suf, <[u8]>::strip_suffix)
+            })
         }),
-        ("trim", v(0), |cv| {
-            bome(cv.1.trim_utf8_with(ByteSlice::trim))
-        }),
+        ("trim", v(0), |cv| bome(trim_with(&cv.1, ByteSlice::trim))),
         ("ltrim", v(0), |cv| {
-            bome(cv.1.trim_utf8_with(ByteSlice::trim_start))
+            bome(trim_with(&cv.1, ByteSlice::trim_start))
         }),
         ("rtrim", v(0), |cv| {
-            bome(cv.1.trim_utf8_with(ByteSlice::trim_end))
+            bome(trim_with(&cv.1, ByteSlice::trim_end))
         }),
         ("escape_sh", v(0), |cv| {
-            bome(
-                cv.1.try_as_utf8_bytes()
-                    .map(|s| ValT::from_utf8_bytes(s.replace(b"'", b"'\\''"))),
-            )
+            let message = "can not be escaped for shell";
+            let s = cv.1.as_utf8_bytes().ok_or_else(|| cv.1.type_error(message));
+            bome(s.map(|s| ValT::from_utf8_bytes(s.replace(b"'", b"'\\''"))))
         }),
         ("halt", v(1), |mut cv| {
             let exit_code = cv.0.pop_var().try_as_i32().map_err(Exn::from);
@@ -643,16 +712,41 @@ where
             use base64::{engine::general_purpose::STANDARD, Engine};
             bome(cv.1.map_utf8_str(|s| STANDARD.encode(s)))
         }),
-        ("decode_base64", v(0), |cv| {
-            use base64::{engine::general_purpose::STANDARD, Engine};
-            bome(cv.1.try_as_utf8_bytes().and_then(|s| {
-                STANDARD
-                    .decode(s)
-                    .map_err(Error::str)
-                    .map(ValT::from_utf8_bytes)
-            }))
-        }),
+        ("decode_base64", v(0), |cv| bome(decode_base64(&cv.1))),
     ])
+}
+
+/// jq's `@base64d`: decoding stops at the first `=`, missing padding is fine, one byte left
+/// over is an error, and the bytes become text as jq makes it (U+FFFD for invalid UTF-8).
+#[cfg(feature = "format")]
+fn decode_base64<V: ValT>(v: &V) -> ValR<V> {
+    let s = v.try_as_utf8_bytes()?;
+    let digit = |b: u8| match b {
+        b'A'..=b'Z' => Some(b - b'A'),
+        b'a'..=b'z' => Some(b - b'a' + 26),
+        b'0'..=b'9' => Some(b - b'0' + 52),
+        b'+' => Some(62),
+        b'/' => Some(63),
+        _ => None,
+    };
+    let mut out = Vec::with_capacity(s.len() / 4 * 3 + 2);
+    let (mut code, mut read) = (0u32, 0);
+    for &b in s.iter().take_while(|b| **b != b'=') {
+        let d = digit(b).ok_or_else(|| v.type_error("is not valid base64 data"))?;
+        code = (code << 6) | u32::from(d);
+        read += 1;
+        if read == 4 {
+            out.extend(code.to_be_bytes()[1..].iter().copied());
+            (code, read) = (0, 0);
+        }
+    }
+    match read {
+        3 => out.extend((code >> 2).to_be_bytes()[2..].iter().copied()),
+        2 => out.push(((code >> 4) & 0xFF) as u8),
+        1 => return Err(v.type_error("trailing base64 byte found")),
+        _ => (),
+    }
+    Ok(V::from_utf8_bytes(jaq_core::jq_utf8::lossy(out)))
 }
 
 #[cfg(feature = "math")]
@@ -679,6 +773,7 @@ where
         math::f_f!(expm1),
         math::f_f!(fabs),
         math::f_fi!(frexp),
+        math::f_fi!(lgamma_r),
         math::f_i!(ilogb),
         math::f_f!(j0),
         math::f_f!(j1),
@@ -732,12 +827,26 @@ where
     let re = cv.0.pop_var();
 
     use crate::regex::Part::{Matches, Mismatch};
-    let fail_flag = |e| Error::str(format_args!("invalid regex flag: {e}"));
     let fail_re = |e| Error::str(format_args!("invalid regex: {e}"));
 
-    let flags = regex::Flags::new(flags.try_as_str()?).map_err(fail_flag)?;
-    let re = flags.regex(re.try_as_str()?).map_err(fail_re)?;
-    let out = regex::regex(cv.1.try_as_utf8_bytes()?, &re, flags, (s, m));
+    // jq's `_match_impl`: the input first, then the regex, then the flags (null for none).
+    let message = "cannot be matched, as it is not a string";
+    let input =
+        cv.1.as_utf8_bytes()
+            .ok_or_else(|| cv.1.type_error(message))?;
+    let re = match re.as_utf8_bytes().map(core::str::from_utf8) {
+        Some(Ok(re)) => re,
+        _ => return Err(re.type_error("is not a string")),
+    };
+    let flags = match flags.as_utf8_bytes().map(core::str::from_utf8) {
+        Some(Ok(flags)) => flags,
+        None if flags.kind_name() == "null" => "",
+        _ => return Err(flags.type_error("is not a string")),
+    };
+    let fail_flag = |_| Error::str(format_args!("{flags} is not a valid modifier string"));
+    let flags = regex::Flags::new(flags).map_err(fail_flag)?;
+    let re = flags.regex(re).map_err(fail_re)?;
+    let out = regex::regex(input, &re, flags, (s, m));
     let sub = |s| cv.1.as_sub_str(s);
     let out = out.into_iter().map(|out| match out {
         Matches(ms) => ms
@@ -777,23 +886,41 @@ where
         }),
         ("strftime", v(1), |cv| {
             unary(cv, |v, fmt| {
-                time::strftime(&v, fmt.try_as_str()?, TimeZone::UTC)
+                time::strftime(&v, &fmt, TimeZone::UTC, "strftime")
             })
         }),
         ("strflocaltime", v(1), |cv| {
             unary(cv, |v, fmt| {
-                time::strftime(&v, fmt.try_as_str()?, TimeZone::system())
+                time::strftime(&v, &fmt, TimeZone::system(), "strflocaltime")
             })
         }),
         ("gmtime", v(0), |cv| {
+            if cv.1.kind_name() != "number" {
+                return bome(Err(Error::str("gmtime() requires numeric inputs")));
+            }
             bome(time::gmtime(&cv.1, TimeZone::UTC))
         }),
         ("localtime", v(0), |cv| {
+            if cv.1.kind_name() != "number" {
+                return bome(Err(Error::str("localtime() requires numeric inputs")));
+            }
             bome(time::gmtime(&cv.1, TimeZone::system()))
         }),
         ("strptime", v(1), |cv| {
             unary(cv, |v, fmt| {
-                time::strptime(v.try_as_str()?, fmt.try_as_str()?)
+                match (v.as_utf8_bytes(), fmt.as_utf8_bytes()) {
+                    (Some(s), Some(f)) => {
+                        match (core::str::from_utf8(s), core::str::from_utf8(f)) {
+                            (Ok(s), Ok(f)) => time::strptime(s, f),
+                            _ => Err(Error::str(
+                                "strptime/1 requires string inputs and arguments",
+                            )),
+                        }
+                    }
+                    _ => Err(Error::str(
+                        "strptime/1 requires string inputs and arguments",
+                    )),
+                }
             })
         }),
         ("mktime", v(0), |cv| bome(time::mktime(&cv.1))),

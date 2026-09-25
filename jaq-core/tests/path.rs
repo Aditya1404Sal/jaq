@@ -68,7 +68,12 @@ fn range_access() {
     give(json!([0, 1, 2]), ".[1:0]", json!([]));
     give(json!([0, 1, 2]), ".[4:5]", json!([]));
 
-    give(json!([0, 1, 2]), ".[0:2,3.14]?", json!([0, 1]));
+    // as in jq, a slice end rounds up
+    gives(
+        json!([0, 1, 2]),
+        ".[0:2,3.14]?",
+        [json!([0, 1]), json!([0, 1, 2])],
+    );
 }
 
 #[test]

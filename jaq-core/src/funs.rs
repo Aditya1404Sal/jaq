@@ -32,14 +32,26 @@ where
             let by = cv.0.pop_var();
             let to = cv.0.pop_var();
             let from = cv.0.pop_var();
+            // jq refuses bounds that are not numbers, where comparing would never end.
+            if from.kind_name() != "number" || to.kind_name() != "number" {
+                return bome(Err(Error::str("Range bounds must be numeric")));
+            }
             Box::new(range(Ok(from), to, by))
         }),
         ("keys_unsorted", v(0), |cv| {
-            bome(cv.1.key_values().map(|kv| kv.map(|(k, _v)| k)).collect())
+            let keys = cv.1.clone().key_values().map(|kv| kv.map(|(k, _v)| k));
+            bome(
+                keys.collect::<Result<_, _>>()
+                    .map_err(|_| cv.1.type_error("has no keys")),
+            )
         }),
         ("key_values", v(0), |cv| {
             let f = |(k, v)| [k, v].into_iter().collect();
-            bome(cv.1.key_values().map(|kv| kv.map(f)).collect())
+            let kvs = cv.1.clone().key_values().map(|kv| kv.map(f));
+            bome(
+                kvs.collect::<Result<_, _>>()
+                    .map_err(|_| cv.1.type_error("has no keys")),
+            )
         }),
     ])
 }

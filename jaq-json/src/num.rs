@@ -36,8 +36,14 @@ impl Num {
         Self::BigInt(i.into())
     }
 
+    /// A number literal (program text or JSON input). A zero stays a decimal literal: jq
+    /// negates a literal zero to `0` (decNumber's `0 - x`), but any computed zero, an `Int`
+    /// here, to `-0`.
     pub(crate) fn from_str(s: &str) -> Self {
-        Self::from_str_radix(s, 10).unwrap_or_else(|| Self::Dec(Rc::new(s.to_string())))
+        match Self::from_str_radix(s, 10) {
+            Some(Self::Int(0)) | None => Self::Dec(Rc::new(s.to_string())),
+            Some(n) => n,
+        }
     }
 
     /// Convert from an integral type to a machine-sized or big integer.
@@ -337,6 +343,8 @@ impl core::ops::Neg for Num {
     type Output = Self;
     fn neg(self) -> Self::Output {
         match self {
+            // Every `Int` zero is computed (see `from_str`): jq's double, negated to `-0`.
+            Self::Int(0) => Self::Float(-0.0),
             Self::Int(x) => int_or_big(x.checked_neg(), [x], |[x]| -x),
             Self::BigInt(x) => Self::big_int(-&*x),
             Self::Float(x) => Self::Float(-x),

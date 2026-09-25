@@ -18,14 +18,15 @@ yields!(
 );
 yields!(
     fromdate_mu,
-    r#""1970-01-02T00:00:00.123456Z" | fromdateiso8601"#,
-    86400.123456
+    r#""1970-01-02T00:00:00.123456Z" | try fromdateiso8601 catch ."#,
+    // jq 1.8 takes whole seconds only
+    "date \"1970-01-02T00:00:00.123456Z\" does not match format \"%Y-%m-%dT%H:%M:%SZ\""
 );
 yields!(todate, r#"86400 | todateiso8601"#, "1970-01-02T00:00:00Z");
 yields!(
     todate_mu,
     "86400.123456 | todateiso8601",
-    "1970-01-02T00:00:00.123456Z"
+    "1970-01-02T00:00:00Z"
 );
 yields!(
     strftime,
@@ -48,11 +49,7 @@ yields!(
     r"86400.123456 | gmtime",
     json!([1970, 0, 2, 0, 0, 0.123456, 5, 1])
 );
-yields!(
-    gmtime_mktime_mu,
-    r"86400.123456 | gmtime | mktime",
-    86400.123456
-);
+yields!(gmtime_mktime_mu, r"86400.123456 | gmtime | mktime", 86400);
 yields!(
     strptime,
     r#""1970-01-02T00:00:00Z" | strptime("%Y-%m-%dT%H:%M:%SZ")"#,
@@ -66,7 +63,12 @@ fn fromtodate() {
     let iso = "2000-01-01T00:00:00Z";
     give(json!(iso), fromto, json!(iso));
     let iso_mu = "2000-01-01T00:00:00.123456Z";
-    give(json!(iso_mu), fromto, json!(iso_mu));
+    let error = format!("date \"{iso_mu}\" does not match format \"%Y-%m-%dT%H:%M:%SZ\"");
+    give(
+        json!(iso_mu),
+        &format!("try ({fromto}) catch ."),
+        json!(error),
+    );
 }
 
 #[test]
