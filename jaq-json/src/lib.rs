@@ -249,6 +249,11 @@ impl jaq_core::ValT for Val {
                     Err(e) => return opt.fail(self, |_| Exn::from(e)),
                 };
 
+                // jq refuses to grow an array past `INT_MAX >> 2` elements rather than allocate.
+                if i > (i32::MAX >> 2) as usize {
+                    let e = Error::str("Array index too large");
+                    return opt.fail(self, |_| Exn::from(e));
+                }
                 let a = Rc::make_mut(a);
                 if i >= a.len() {
                     a.resize(i + 1, Val::Null);

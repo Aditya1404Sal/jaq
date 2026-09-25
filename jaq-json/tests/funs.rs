@@ -10,6 +10,23 @@ yields!(bsearch_absent2, "[1, 3] | bsearch(2)", -2);
 yields!(bsearch_absent3, "[1, 3] | bsearch(4)", -3);
 yields!(bsearch_present, "[1, 3] | [bsearch(1, 3)]", [0, 1]);
 
+// Like jq, an index past the end extends the array with nulls, up to jq's limit of
+// `INT_MAX >> 2`; past it jq refuses instead of allocating.
+yields!(
+    index_update_extends,
+    "[] | .[3] = 1",
+    json!([null, null, null, 1])
+);
+yields!(
+    index_update_too_large,
+    "[[536870912, 2147483648, 4294967295][] as $i | try ([] | .[$i] = 1 | length) catch .]",
+    [
+        "Array index too large",
+        "Array index too large",
+        "Array index too large"
+    ]
+);
+
 yields!(
     fromjson_inf,
     r#""Infinity +Infinity -Infinity" | [fromjson | tostring]"#,
@@ -214,7 +231,11 @@ yields!(
     r#"{"a":[]} | .a[2].b = 1 | tojson"#,
     r#"{"a":[null,null,{"b":1}]}"#
 );
-yields!(jq_negative_zero_literal, r#""[-0.0]" | fromjson | tojson"#, "[-0.0]");
+yields!(
+    jq_negative_zero_literal,
+    r#""[-0.0]" | fromjson | tojson"#,
+    "[-0.0]"
+);
 yields!(jq_null_slice, "null | .[1:] | tojson", "null");
 yields!(
     jq_negative_out_of_bounds,
