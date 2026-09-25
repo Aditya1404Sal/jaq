@@ -528,3 +528,23 @@ yields!(
     "[[1, [[2]]]] | foreach (0, 1, 0) as $p (.; .[$p]; if $p == 0 then .[0] else {}[] as $x | . end) += 1",
     json!([[2, [[3]]]])
 );
+
+/// jq folds a parenthesised object key made of constants; the loader reports each such key as
+/// written between its parentheses, in jq's order (an entry after its value).
+#[test]
+fn const_keys() {
+    use jaq_core::load::{Arena, File, Loader};
+    let keys = |code: &str| {
+        let arena = Arena::default();
+        let loader = Loader::new(jaq_core::defs());
+        let modules = loader.load(&arena, File { code, path: () }).unwrap();
+        let keys: Vec<String> = modules.const_keys().iter().map(|k| k.to_string()).collect();
+        keys
+    };
+    let code = "{( 1 + 1 ): {([1, \"a\"]): 2}, (.): 3, (-1): 4, ({a: 1}) : 5} as {(null): $x} | 6";
+    assert_eq!(keys(code), ["[1, \"a\"]", "1 + 1", "{a: 1}", "null"]);
+    assert_eq!(
+        keys("{(1 # c\n): 2, (true, 1): 3, ($__loc__): 4}"),
+        ["1", "$__loc__"]
+    );
+}

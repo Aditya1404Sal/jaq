@@ -113,6 +113,8 @@ pub struct Module<S, B = Vec<Def<S>>> {
     pub(crate) vars: Vars<S>,
     /// everything that comes after metadata and includes/imports
     pub(crate) body: B,
+    /// constant parenthesised object keys, as written
+    pub(crate) const_keys: Vec<S>,
 }
 
 /// Tree of modules containing definitions, and a main module.
@@ -122,6 +124,16 @@ pub struct Modules<S, P> {
 }
 
 impl<S, P> Modules<S, P> {
+    /// Parenthesised object keys of the main module that jq folds into constants, each as
+    /// written between its parentheses, in the order jq checks them.
+    ///
+    /// jq refuses a program in which such a key is not a string before running it
+    /// (`Cannot use number (1) as object key`); a caller that evaluates these keys can do
+    /// the same.
+    pub fn const_keys(&self) -> &[S] {
+        &self.main.1.const_keys
+    }
+
     pub(crate) fn file_vars(&self) -> impl Iterator<Item = (&File<S, P>, &Vars<S>)> {
         let mod_vars = self.deps.iter().map(|(file, module)| (file, &module.vars));
         mod_vars.chain([(&self.main.0, &self.main.1.vars)])
@@ -162,6 +174,7 @@ impl<S: core::ops::Deref<Target = str>, B> parse::Module<S, B> {
                 mods,
                 vars,
                 body: self.body,
+                const_keys: self.const_keys,
             })
         } else {
             Err(Error::Io(errs))
