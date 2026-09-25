@@ -671,6 +671,21 @@ fn obj_merge(l: &mut Rc<Map>, r: Rc<Map>) {
     });
 }
 
+/// jq caps a repeated string's result length at `INT_MAX` (its `jv` string length field is a
+/// signed 32-bit int internally, even on a 64-bit host) and refuses to even attempt building a
+/// longer one, rather than let the allocation run — which, unlike jq's own native process, this
+/// tool cannot recover from: a WASI allocation failure aborts the whole component. Verified
+/// against the oracle: `"a" * 1500000000` (a sub-`INT_MAX` result) succeeds, `"a" * 2147483647`
+/// (`INT_MAX` exactly) and `"a" * 4294967296` do not.
+const MAX_REPEATED_STRING_LEN: usize = i32::MAX as usize;
+
+fn checked_repeat_len(part_len: usize, count: isize) -> Result<usize, Error> {
+    part_len
+        .checked_mul(count as usize)
+        .filter(|&len| len <= MAX_REPEATED_STRING_LEN)
+        .ok_or_else(|| Error::str("Repeat string result too long"))
+}
+
 impl core::ops::Mul for Val {
     type Output = ValR;
     fn mul(self, rhs: Self) -> Self::Output {
@@ -683,9 +698,11 @@ impl core::ops::Mul for Val {
                 s * Num(Int(bigint_to_int_saturated(&i)))
             }
             (BStr(s), Num(Int(i))) | (Num(Int(i)), BStr(s)) if i > 0 => {
+                checked_repeat_len(s.len(), i)?;
                 Ok(Self::byte_str(s.repeat(i as usize)))
             }
             (TStr(s), Num(Int(i))) | (Num(Int(i)), TStr(s)) if i > 0 => {
+                checked_repeat_len(s.len(), i)?;
                 Ok(Self::utf8_str(s.repeat(i as usize)))
             }
             // string multiplication with negatives or 0 results in null
