@@ -287,10 +287,24 @@ fn base<D: for<'a> DataT<V<'a> = Val>>() -> Box<[Filter<RunPtr<D>>]> {
             })
         }),
         ("bsearch", v(1), |cv| {
-            let to_idx = |r: Result<_, _>| r.map_or_else(|i| -1 - i as isize, |i| i as isize);
             unary(cv, move |a, x| {
-                a.as_arr().map(|a| Val::from(to_idx(a.binary_search(&x))))
+                a.as_arr().map(|a| Val::from(bsearch(a, &x)))
             })
         }),
     ])
+}
+
+/// jq's binary search: the index of `x` in `a`, or `-1 - i` for the index `i` it would go at.
+/// On an unsorted array, it finds what jq's own search finds.
+fn bsearch(a: &[Val], x: &Val) -> isize {
+    let (mut start, mut end) = (0, a.len());
+    while start < end {
+        let mid = start + (end - start) / 2;
+        match x.cmp(&a[mid]) {
+            core::cmp::Ordering::Equal => return mid as isize,
+            core::cmp::Ordering::Less => end = mid,
+            core::cmp::Ordering::Greater => start = mid + 1,
+        }
+    }
+    -1 - start as isize
 }

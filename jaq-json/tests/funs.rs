@@ -10,6 +10,12 @@ yields!(bsearch_absent1, "[1, 3] | bsearch(0)", -1);
 yields!(bsearch_absent2, "[1, 3] | bsearch(2)", -2);
 yields!(bsearch_absent3, "[1, 3] | bsearch(4)", -3);
 yields!(bsearch_present, "[1, 3] | [bsearch(1, 3)]", [0, 1]);
+// jq's own search on an unsorted array.
+yields!(
+    bsearch_unsorted,
+    "[3, 2, 1] | [bsearch(2, 3, 0, 4)]",
+    [1, -4, -1, -4]
+);
 
 // FA-070: `"a" * 4294967296` used to abort the whole (sandboxed) process attempting the
 // allocation instead of refusing — jq itself refuses any repeat past `INT_MAX` result bytes,
