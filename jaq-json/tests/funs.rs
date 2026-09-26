@@ -528,3 +528,29 @@ fn operand_order() {
         json!([13, 14, 23, 24]),
     );
 }
+
+// Colored as jq 1.8 colors: its default styles, commas in their array's or object's style, and
+// an empty array or object styled as one.
+#[test]
+fn ansi_colors() {
+    use jaq_json::write::{write, Pp, Styles};
+    // (`json!` orders the keys.)
+    let value: jaq_json::Val =
+        serde_json::from_value(json!({"a": [1, "x", null, [], {}], "b": 2, "c": {"d": true}}))
+            .unwrap();
+    let pp = Pp {
+        styles: Styles::ansi(),
+        ..Pp::default()
+    };
+    let mut out = Vec::new();
+    write(&mut out, &pp, 0, &value).unwrap();
+    let (o, a) = ("\x1b[1;39m", "\x1b[1;39m");
+    let (k, r) = ("\x1b[1;34m", "\x1b[0m");
+    let expected = format!(
+        "{o}{{{r}{k}\"a\"{r}{o}:{r}{a}[{r}\x1b[0;39m1{r}{a},{r}\x1b[0;32m\"x\"{r}{a},{r}\
+         \x1b[0;90mnull{r}{a},{r}{a}[]{r}{a},{r}{o}{{}}{r}{a}]{r}{o},{r}{k}\"b\"{r}{o}:{r}\
+         \x1b[0;39m2{r}{o},{r}{k}\"c\"{r}{o}:{r}{o}{{{r}{k}\"d\"{r}{o}:{r}\x1b[0;39mtrue{r}{o}}}{r}\
+         {o}}}{r}"
+    );
+    assert_eq!(String::from_utf8(out).unwrap(), expected);
+}

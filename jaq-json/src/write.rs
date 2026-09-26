@@ -126,9 +126,9 @@ pub struct Styles<S = String> {
 }
 
 impl Styles {
-    /// Default ANSI styles
+    /// Default ANSI styles, as jq 1.8's
     pub fn ansi() -> Self {
-        let mut cols = Styles::default().parse("90:39:39:39:32:1;39:1;39:1;34");
+        let mut cols = Styles::default().parse("0;90:0;39:0;39:0;39:0;32:1;39:1;39:1;34");
         cols.bstr = "\x1b[31m".into();
         cols.reset = "\x1b[0m".into();
         cols
@@ -350,11 +350,12 @@ pub(crate) fn walk<W: ?Sized, E>(
     loop {
         match next.take() {
             Some((_, level)) if level - top > MAX_PRINT_DEPTH => text(w, "<skipped: too deep>")?,
+            // As jq, an empty array or object is styled as one.
+            Some((Val::Arr(a), _)) if a.is_empty() => styled(w, &pp.styles.arr, "[]")?,
+            Some((Val::Obj(o), _)) if o.is_empty() => styled(w, &pp.styles.obj, "{}")?,
             Some((Val::Arr(a), level)) => {
                 styled(w, &pp.styles.arr, "[")?;
-                if a.is_empty() {
-                    styled(w, &pp.styles.arr, "]")?;
-                } else {
+                {
                     if indent.is_some() {
                         text(w, "\n")?;
                     }
@@ -369,9 +370,7 @@ pub(crate) fn walk<W: ?Sized, E>(
             }
             Some((Val::Obj(o), level)) => {
                 styled(w, &pp.styles.obj, "{")?;
-                if o.is_empty() {
-                    styled(w, &pp.styles.obj, "}")?;
-                } else {
+                {
                     if indent.is_some() {
                         text(w, "\n")?;
                     }
@@ -399,7 +398,13 @@ pub(crate) fn walk<W: ?Sized, E>(
         match frame.entries.next() {
             Some((k, x)) => {
                 if !core::mem::take(&mut frame.first) {
-                    text(w, ",")?;
+                    // As jq, a comma takes its array's or object's style.
+                    let style = if frame.obj {
+                        &pp.styles.obj
+                    } else {
+                        &pp.styles.arr
+                    };
+                    styled(w, style, ",")?;
                     if pp.sep_space && indent.is_none() {
                         text(w, " ")?;
                     }
