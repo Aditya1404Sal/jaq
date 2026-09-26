@@ -56,6 +56,23 @@ yields!(
     [1970, 0, 2, 0, 0, 0, 5, 1]
 );
 yields!(mktime, "[ 1970, 0, 2, 0, 0, 0, 5, 1 ] | mktime", 86400);
+// Without a date, jq's `struct tm` of zeros: 1900, January, day 0, and jq's markers for the
+// days of the week and year it cannot compute.
+yields!(
+    strptime_time_only,
+    r#""10:15" | strptime("%H:%M")"#,
+    [1900, 0, 0, 10, 15, 0, 8, 367]
+);
+yields!(
+    strptime_time_only_mktime,
+    r#""10:15" | strptime("%H:%M") | mktime"#,
+    -2209038300_i64
+);
+yields!(
+    strptime_date,
+    r#""2015-03-05" | strptime("%Y-%m-%d")"#,
+    [2015, 2, 5, 0, 0, 0, 4, 63]
+);
 
 #[test]
 fn fromtodate() {
