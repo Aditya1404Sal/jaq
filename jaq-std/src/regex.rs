@@ -63,9 +63,109 @@ impl Flags {
     }
 
     pub fn regex(self, re: &str) -> Result<Regex, Error> {
+        // `regex_bites` ignores the case of ASCII letters only; jq (Oniguruma) of any letter.
+        let unicode;
+        let re = if self.i && !re.is_ascii() {
+            unicode = unicode_case_insensitive(re);
+            unicode.as_str()
+        } else {
+            re
+        };
         let mut builder = RegexBuilder::new(re);
         self.impact(&mut builder).build()
     }
+}
+
+/// The other cases of `c` that are one character each, in the simple case mapping.
+fn other_cases(c: char) -> Vec<char> {
+    let mut cases = Vec::new();
+    for case in [
+        c.to_lowercase().collect::<Vec<_>>(),
+        c.to_uppercase().collect::<Vec<_>>(),
+    ] {
+        if let [other] = case[..] {
+            if other != c && !cases.contains(&other) {
+                cases.push(other);
+            }
+        }
+    }
+    cases
+}
+
+/// `re` with each letter beyond ASCII matching its other cases too: a literal one becomes a
+/// class of its cases, and one in a class (not an end of a range) is joined by its cases.
+fn unicode_case_insensitive(re: &str) -> String {
+    let mut out = String::with_capacity(re.len());
+    let mut chars = re.chars().peekable();
+    // How deep in classes, and whether the class just opened (where `]` is a member).
+    let mut depth = 0_usize;
+    let mut class_start = false;
+    let mut previous = None;
+    while let Some(c) = chars.next() {
+        let starting = core::mem::replace(&mut class_start, false);
+        match c {
+            '\\' => {
+                out.push(c);
+                if let Some(next) = chars.next() {
+                    out.push(next);
+                    // `\p{...}`, `\x{...}`, `\u{...}`: the braces are part of the escape.
+                    if chars.peek() == Some(&'{') {
+                        for braced in chars.by_ref() {
+                            out.push(braced);
+                            if braced == '}' {
+                                break;
+                            }
+                        }
+                    }
+                }
+                previous = None;
+                continue;
+            }
+            '[' if depth > 0 && chars.peek() == Some(&':') => {
+                // A POSIX class, `[:alpha:]`, is copied whole.
+                out.push(c);
+                let mut prev = c;
+                for next in chars.by_ref() {
+                    out.push(next);
+                    if prev == ':' && next == ']' {
+                        break;
+                    }
+                    prev = next;
+                }
+            }
+            '[' => {
+                out.push(c);
+                depth += 1;
+                if chars.peek() == Some(&'^') {
+                    out.push('^');
+                    chars.next();
+                }
+                class_start = true;
+            }
+            ']' if depth > 0 && !starting => {
+                out.push(c);
+                depth -= 1;
+            }
+            c if c.is_ascii() => out.push(c),
+            c => {
+                let cases = other_cases(c);
+                let in_range = previous == Some('-') || chars.peek() == Some(&'-');
+                if cases.is_empty() || (depth > 0 && in_range) {
+                    out.push(c);
+                } else if depth > 0 {
+                    out.push(c);
+                    out.extend(cases);
+                } else {
+                    out.push('[');
+                    out.push(c);
+                    out.extend(cases);
+                    out.push(']');
+                }
+            }
+        }
+        previous = Some(c);
+    }
+    out
 }
 
 type CharIndices<'a> =

@@ -164,6 +164,13 @@ yields!(
     [10.0, 11.0, 12.0, 13.0, 7.0, 8.0, 8.0, 9.0]
 );
 
+// jq ignores the case of every letter, not only ASCII ones.
+yields!(
+    regex_unicode_case,
+    r#"["É" | test("é"; "i"), test("[é]"; "i"), test("é"), ("ÉCOLE" | test("école"; "i"))]"#,
+    [true, true, false, true]
+);
+
 #[test]
 #[allow(clippy::zero_prefixed_literal)]
 fn regex() {
