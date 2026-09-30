@@ -12,7 +12,7 @@
 //! This was adapted from
 //! <https://ycpcs.github.io/cs340-fall2017/lectures/lecture06.html#implementation>.
 
-use core::iter::Peekable;
+use alloc::vec::Vec;
 
 /// Associativity of an operator.
 pub enum Associativity {
@@ -37,30 +37,38 @@ pub trait Expr<O: Op> {
 }
 
 /// Perform precedence climbing.
+///
+/// This is the shunting-yard form of precedence climbing: operators wait on a stack until an
+/// operator that binds less tightly arrives, so a long chain of operators (`1 + 1 + ...`,
+/// `f | g | ...`) is parsed without recursing once per operator.
 pub fn climb<O: Op, T: Expr<O>>(head: T, iter: impl IntoIterator<Item = (O, T)>) -> T {
-    climb1(head, &mut iter.into_iter().peekable(), 0)
-}
-
-fn climb1<O: Op, T: Expr<O>, I>(mut x: T, iter: &mut Peekable<I>, min_prec: usize) -> T
-where
-    I: Iterator<Item = (O, T)>,
-{
-    while let Some((op, mut rhs)) = iter.next_if(|(op, _)| op.precedence() >= min_prec) {
-        let right_assoc = matches!(op.associativity(), Associativity::Right);
-        let this_prec = op.precedence();
-
-        while let Some(next) = iter.peek() {
-            let next_prec = next.0.precedence();
-
-            if next_prec > this_prec || (right_assoc && next_prec == this_prec) {
-                rhs = climb1(rhs, iter, next_prec);
+    let mut operands = Vec::from([head]);
+    let mut ops: Vec<O> = Vec::new();
+    for (op, rhs) in iter {
+        while let Some(top) = ops.last() {
+            let (top_prec, prec) = (top.precedence(), op.precedence());
+            let left = matches!(op.associativity(), Associativity::Left);
+            if top_prec > prec || (top_prec == prec && left) {
+                reduce(&mut operands, &mut ops);
             } else {
                 break;
             }
         }
-        x = T::from_op(x, op, rhs);
+        ops.push(op);
+        operands.push(rhs);
     }
-    x
+    while !ops.is_empty() {
+        reduce(&mut operands, &mut ops);
+    }
+    operands.pop().expect("one operand is left")
+}
+
+/// Replace the two topmost operands by the topmost operator applied to them.
+fn reduce<O: Op, T: Expr<O>>(operands: &mut Vec<T>, ops: &mut Vec<O>) {
+    let (Some(op), Some(rhs), Some(lhs)) = (ops.pop(), operands.pop(), operands.pop()) else {
+        unreachable!("an operator always has two operands")
+    };
+    operands.push(T::from_op(lhs, op, rhs));
 }
 
 /// Simple arithmetic expressions

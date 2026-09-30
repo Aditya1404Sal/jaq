@@ -32,14 +32,26 @@ where
             let by = cv.0.pop_var();
             let to = cv.0.pop_var();
             let from = cv.0.pop_var();
+            // jq refuses bounds that are not numbers, where comparing would never end.
+            if from.kind_name() != "number" || to.kind_name() != "number" {
+                return bome(Err(Error::str("Range bounds must be numeric")));
+            }
             Box::new(range(Ok(from), to, by))
         }),
         ("keys_unsorted", v(0), |cv| {
-            bome(cv.1.key_values().map(|kv| kv.map(|(k, _v)| k)).collect())
+            let keys = cv.1.clone().key_values().map(|kv| kv.map(|(k, _v)| k));
+            bome(
+                keys.collect::<Result<_, _>>()
+                    .map_err(|_| cv.1.type_error("has no keys")),
+            )
         }),
         ("key_values", v(0), |cv| {
             let f = |(k, v)| [k, v].into_iter().collect();
-            bome(cv.1.key_values().map(|kv| kv.map(f)).collect())
+            let kvs = cv.1.clone().key_values().map(|kv| kv.map(f));
+            bome(
+                kvs.collect::<Result<_, _>>()
+                    .map_err(|_| cv.1.type_error("has no keys")),
+            )
         }),
     ])
 }
@@ -59,7 +71,14 @@ fn range<V: ValT>(mut from: ValX<V>, to: V, by: V) -> impl Iterator<Item = ValX<
         Ok(x) => match cmp {
             Greater => x < to,
             Less => x > to,
-            Equal => x != to,
+            // FA-070: a zero step never advances `from`, so looping on `x != to` (as the
+            // idealized `while` definition above literally says) never terminates whenever
+            // `from != to` — this used to hang the whole tool. jq's own native range doesn't
+            // symbolically expand that `while` at all here; it special-cases a zero step to
+            // produce nothing, matching neither the "loop forever" nor "loop once" reading
+            // (verified against the oracle: `range(0;10;0)` yields the empty stream, not an
+            // infinite one stuck at `from`, and not a single `0` either).
+            Equal => false,
         }
         .then(|| core::mem::replace(&mut from, (x + by.clone()).map_err(Exn::from))),
         e @ Err(_) => {
@@ -119,10 +138,16 @@ macro_rules! while_gtz {
 /// However, this does not allow `path(limit(...))`, because
 /// `limit` binds the outputs of `f` to a variable (`$x`).
 /// Variables never have a path in jaq, whereas they may in jq.
+///
+/// Like jq, both fail for a count below 0 (or one that is not a number and not above 0).
 macro_rules! limit {
     ( $run:ident ) => {
         |mut cv| {
             let ((f, fc), n) = (cv.0.pop_fun(), cv.0.pop_var());
+            if n < 0.into() {
+                let error = Error::str("limit doesn't support negative count");
+                return Box::new(core::iter::once(Err(Exn::from(error))));
+            }
             if n <= 0.into() {
                 return Box::new(core::iter::empty());
             }
@@ -135,6 +160,10 @@ macro_rules! skip {
     ( $run:ident ) => {
         |mut cv| {
             let ((f, fc), n) = (cv.0.pop_fun(), cv.0.pop_var());
+            if n < 0.into() {
+                let error = Error::str("skip doesn't support negative count");
+                return Box::new(core::iter::once(Err(Exn::from(error))));
+            }
             let mut iter = f.$run((fc, cv.1));
             if n <= 0.into() {
                 return iter;

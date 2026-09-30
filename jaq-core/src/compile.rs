@@ -130,6 +130,16 @@ pub(crate) enum Term<T = TermId> {
     Logic(T, bool, T),
     /// Arithmetical operation (`f + g`, `f - g`, `f * g`, `f / g`, `f % g`)
     Math(T, ops::Math, T),
+    /// The entries of an object construction put together (`{a: f, b: g}`): as `f + g`, but with
+    /// the outputs of `f` outermost, as jq builds objects
+    Merge(T, T),
+    /// Chain of arithmetical operations of one precedence (`f + g - h + ...`), evaluated as the
+    /// nested `Math` it stands for without recursing once per operator
+    MathChain(T, Box<[(ops::Math, T)]>),
+    /// Chain of pipes of which some bind variables (`f as $x | g | h as $y | i`), evaluated as the
+    /// nested `Pipe` it stands for without recursing once per stage: each stage is a filter
+    /// (without pattern) or a binding (with pattern), followed by the last filter
+    Pipeline(Box<[(T, Option<Pattern<T>>)]>, T),
     /// Comparison operation (`f < g`, `f <= g`, `f > g`, `f >= g`, `f == g`, `f != g`)
     Cmp(T, ops::Cmp, T),
     /// Alternation (`f // g`)
@@ -225,6 +235,9 @@ pub struct Compiler<S, F> {
     locals: Locals<S>,
 
     errs: Vec<Error<S>>,
+
+    /// The code of the module being compiled, where `$__loc__` finds its line.
+    code: Option<S>,
 }
 
 type Def<S> = (Sig<S>, TermId, Tr);
@@ -243,6 +256,7 @@ impl<S, F> Default for Compiler<S, F> {
             imported_vars: Vec::new(),
             locals: Locals::default(),
             errs: Vec::new(),
+            code: None,
         }
     }
 }
@@ -511,12 +525,14 @@ impl<'s, F> Compiler<&'s str, F> {
 
         let mut errs = Vec::new();
         for (file, module) in mods.deps {
+            self.code = Some(file.code);
             let defs = self.open_module(module);
             let defs = self.module(defs);
             self.mod_map.push(defs);
             self.close_module(file, &mut errs)
         }
         let (file, module) = mods.main;
+        self.code = Some(file.code);
         let main = self.open_module(module);
         let id = self.iterm(main);
         self.close_module(file, &mut errs);
@@ -665,7 +681,12 @@ impl<'s, F> Compiler<&'s str, F> {
 
                 return (t, tr_);
             }
-            Num(n) => n.parse().map_or_else(|_| Term::Num(n.into()), Term::Int),
+            // A zero literal is left to the value type, which may tell it from a computed zero
+            // (jq negates a literal zero to `0` and a computed one to `-0`).
+            Num(n) => match n.parse() {
+                Ok(0) | Err(_) => Term::Num(n.into()),
+                Ok(i) => Term::Int(i),
+            },
             TryCatch(try_, catch) => {
                 let catch = catch.map_or_else(|| Call("!empty", Vec::new()), |t| *t);
                 Term::TryCatch(self.iterm(*try_), self.iterm(catch))
@@ -695,6 +716,15 @@ impl<'s, F> Compiler<&'s str, F> {
                     }
                     _ => self.fail(name, Undefined::Filter(arity)),
                 }
+            }
+            BinOp(l, parse::BinaryOp::Pipe(Some(parse::Pattern::Alt(alts))), r) => {
+                return self.term(destructure_alts(*l, alts, *r), tr);
+            }
+            BinOp(l, parse::BinaryOp::Pipe(pat), r) => {
+                return self.pipeline(BinOp(l, parse::BinaryOp::Pipe(pat), r), tr);
+            }
+            BinOp(l, op, r) if chain_class(&op).is_some() => {
+                return self.chain(BinOp(l, op, r), tr)
             }
             BinOp(l, op, r) => {
                 use parse::BinaryOp::*;
@@ -749,7 +779,7 @@ impl<'s, F> Compiler<&'s str, F> {
             }
             Obj(o) => {
                 let kvs = o.into_iter().map(|(k, v)| self.obj_entry(k, v)).collect();
-                self.sum_or(|| Term::ObjEmpty, kvs)
+                self.merge_or(|| Term::ObjEmpty, kvs)
             }
         };
         (t, Tr::new())
@@ -784,6 +814,11 @@ impl<'s, F> Compiler<&'s str, F> {
                 let iter = o.into_iter().map(|(k, p)| (self.iterm(k), self.pattern(p)));
                 Pattern::Idx(iter.collect())
             }
+            // `term` rewrites `?//` before its patterns get here.
+            parse::Pattern::Alt(alts) => match alts.into_iter().next() {
+                Some(first) => self.pattern(first),
+                None => Pattern::Var,
+            },
         }
     }
 
@@ -857,7 +892,28 @@ impl<'s, F> Compiler<&'s str, F> {
                 i += 1;
             }
         }
+        if x == "$__loc__" {
+            return self.loc(x);
+        }
         self.fail(x, Undefined::Var)
+    }
+
+    /// jq's `$__loc__`: `{"file": "<top-level>", "line": N}` for where it is written.
+    fn loc(&mut self, x: &'s str) -> Term {
+        let offset = self
+            .code
+            .and_then(|code| (x.as_ptr() as usize).checked_sub(code.as_ptr() as usize))
+            .unwrap_or(0);
+        let before = self.code.map_or("", |code| &code[..offset.min(code.len())]);
+        let line = before.matches('\n').count() + 1;
+        let mut entry = |k: &str, v: Term| {
+            let k = self.lut.insert_term(Term::Str(k.into()));
+            let v = self.lut.insert_term(v);
+            Term::ObjSingle(k, v)
+        };
+        let file = entry("file", Term::Str("<top-level>".into()));
+        let line = entry("line", Term::Int(line as isize));
+        self.merge_or(|| Term::ObjEmpty, alloc::vec![file, line])
     }
 
     fn break_(&mut self, x: &'s str) -> Term {
@@ -885,13 +941,178 @@ impl<'s, F> Compiler<&'s str, F> {
         Term::ObjSingle(k, v)
     }
 
+    /// The sum of `terms` (string parts, object entries), or `f()` if there are none.
+    ///
+    /// Addition of strings and of objects is associative, so the sum is a balanced tree: a string
+    /// of many parts or an object of many entries nests only logarithmically deep.
     fn sum_or(&mut self, f: impl FnOnce() -> Term, terms: Vec<Term>) -> Term {
         use ops::Math::Add;
-        let mut iter = terms.into_iter().rev();
-        let last = iter.next().unwrap_or_else(f);
-        iter.fold(last, |acc, x| {
-            Term::Math(self.lut.insert_term(x), Add, self.lut.insert_term(acc))
-        })
+        self.sum_with(f, terms, &|l, r| Term::Math(l, Add, r))
+    }
+
+    /// The entries of an object put together (see [`Term::Merge`]), or `f()` if there are none.
+    fn merge_or(&mut self, f: impl FnOnce() -> Term, terms: Vec<Term>) -> Term {
+        self.sum_with(f, terms, &Term::Merge)
+    }
+
+    fn sum_with(
+        &mut self,
+        f: impl FnOnce() -> Term,
+        terms: Vec<Term>,
+        add: &impl Fn(TermId, TermId) -> Term,
+    ) -> Term {
+        let ids: Vec<_> = terms.into_iter().map(|t| self.lut.insert_term(t)).collect();
+        match ids[..] {
+            [] => f(),
+            [id] => core::mem::take(&mut self.lut.terms[id.0]),
+            _ => self.balanced(&ids, add),
+        }
+    }
+
+    /// A balanced tree of `f` over `ids` (at least two), for an associative operation.
+    fn balanced(&mut self, ids: &[TermId], f: &impl Fn(TermId, TermId) -> Term) -> Term {
+        let (l, r) = ids.split_at(ids.len() / 2);
+        let mut half = |ids: &[TermId]| match ids {
+            [id] => *id,
+            ids => {
+                let t = self.balanced(ids, f);
+                self.lut.insert_term(t)
+            }
+        };
+        let l = half(l);
+        let r = half(r);
+        f(l, r)
+    }
+
+    /// Compile a chain of left-associative operators of one class (`f, g, h`, `f + g - h`, ...)
+    /// without recursing once per operator.
+    ///
+    /// `,`, `and`, `or` and `//` are associative, so they become balanced trees; arithmetic
+    /// becomes a [`Term::MathChain`] (two operands stay a plain [`Term::Math`]).
+    fn chain(&mut self, t: parse::Term<&'s str>, tr: &Tr) -> (Term, Tr) {
+        use parse::BinaryOp::{Alt, And, Comma, Math, Or};
+        let parse::Term::BinOp(_, op, _) = &t else {
+            return self.term(t, tr);
+        };
+        let class = chain_class(op);
+        // the operands, first to last, and the operator before each operand after the first
+        let mut rest = Vec::new();
+        let mut first = t;
+        while let parse::Term::BinOp(l, op, r) = first {
+            if chain_class(&op) != class {
+                first = parse::Term::BinOp(l, op, r);
+                break;
+            }
+            rest.push((op, *r));
+            first = *l;
+        }
+        rest.reverse();
+        let last = rest.len();
+        match &rest[0].0 {
+            Comma => {
+                let (first, mut tr_) = self.iterm_tr(first, tr);
+                let mut ids = Vec::from([first]);
+                for (_, t) in rest {
+                    let (id, tr_t) = self.iterm_tr(t, tr);
+                    tr_.extend(tr_t);
+                    ids.push(id);
+                }
+                (self.balanced(&ids, &Term::Comma), tr_)
+            }
+            Alt => {
+                let mut ids = Vec::from([self.iterm(first)]);
+                let mut tr_ = Tr::new();
+                for (i, (_, t)) in rest.into_iter().enumerate() {
+                    if i + 1 == last {
+                        let (id, tr_t) = self.iterm_tr(t, tr);
+                        tr_ = tr_t;
+                        ids.push(id);
+                    } else {
+                        ids.push(self.iterm(t));
+                    }
+                }
+                (self.balanced(&ids, &Term::Alt), tr_)
+            }
+            Or | And => {
+                let stop = matches!(rest[0].0, Or);
+                let mut ids = Vec::from([self.iterm(first)]);
+                ids.extend(rest.into_iter().map(|(_, t)| self.iterm(t)));
+                (
+                    self.balanced(&ids, &|l, r| Term::Logic(l, stop, r)),
+                    Tr::new(),
+                )
+            }
+            _ => {
+                let first = self.iterm(first);
+                let mut ops = Vec::new();
+                for (op, t) in rest {
+                    if let Math(op) = op {
+                        ops.push((op, self.iterm(t)));
+                    }
+                }
+                let t = match ops[..] {
+                    [(op, r)] => Term::Math(first, op, r),
+                    _ => Term::MathChain(first, ops.into()),
+                };
+                (t, Tr::new())
+            }
+        }
+    }
+
+    /// Compile a chain of pipes (`f | g`, `f as $x | g`) without recursing once per stage.
+    ///
+    /// Plain pipes are associative, so a chain of them becomes a balanced tree; a chain in which
+    /// variables are bound becomes a [`Term::Pipeline`] (one stage stays a plain [`Term::Pipe`]).
+    fn pipeline(&mut self, t: parse::Term<&'s str>, tr: &Tr) -> (Term, Tr) {
+        use parse::BinaryOp::Pipe;
+        let mut stages = Vec::new();
+        let mut last = t;
+        loop {
+            match last {
+                parse::Term::BinOp(l, Pipe(pat), r)
+                    if !matches!(pat, Some(parse::Pattern::Alt(_))) =>
+                {
+                    stages.push((*l, pat));
+                    last = *r;
+                }
+                t => {
+                    last = t;
+                    break;
+                }
+            }
+        }
+        // Each stage is compiled where the variables bound before it are visible, its pattern
+        // (whose keys may be terms) before its own variables are.
+        let mut bound: Vec<&'s str> = Vec::new();
+        let mut compiled = Vec::with_capacity(stages.len());
+        for (l, pat) in stages {
+            let l = self.iterm(l);
+            let pat = pat.map(|pat| {
+                let vars: Vec<_> = pat.vars().copied().collect();
+                let pat = self.pattern(pat);
+                for v in vars {
+                    self.locals.vars.push(Bind::Var(v));
+                    bound.push(v);
+                }
+                pat
+            });
+            compiled.push((l, pat));
+        }
+        let (last, tr_) = self.iterm_tr(last, tr);
+        for v in bound.iter().rev() {
+            self.locals.vars.pop(&Bind::Var(v));
+        }
+        let t = if compiled.iter().all(|(_, pat)| pat.is_none()) {
+            let mut ids: Vec<_> = compiled.into_iter().map(|(l, _)| l).collect();
+            ids.push(last);
+            self.balanced(&ids, &|l, r| Term::Pipe(l, None, r))
+        } else if compiled.len() == 1 {
+            let (l, pat) = compiled.remove(0);
+            Term::Pipe(l, pat, last)
+        } else {
+            Term::Pipeline(compiled.into(), last)
+        };
+        (t, tr_)
     }
 }
 
@@ -986,4 +1207,63 @@ fn tco() {
       f          # main -> { } (f is called with CatchOne)
     "#;
     assert_eq!(*calls_in(f), [CatchOne, CatchAll, Throw]);
+}
+
+/// jq's destructuring alternatives: `l as p1 ?// p2 ?// ... ?// pn | r` binds each value of `l`
+/// to `p1` and runs `r`; if that fails (binding or `r`), it tries the next pattern, and the last
+/// one's error is the result. Every variable of every pattern is bound, to `null` where the
+/// pattern in use does not name it. As a term:
+///
+/// ~~~ text
+/// l as $?// | try ($?// as p1 | r1) catch try ($?// as p2 | r2) catch ... ($?// as pn | rn)
+/// ~~~
+///
+/// where `ri` is `r` behind `null as $x |` for each variable `$x` that `pi` lacks.
+/// The class of a left-associative operator whose chains [`Compiler::chain`] compiles without
+/// recursing: operators of one class chain with each other.
+fn chain_class<S>(op: &parse::BinaryOp<S>) -> Option<u8> {
+    use ops::Math::{Add, Div, Mul, Rem, Sub};
+    use parse::BinaryOp::{Alt, And, Comma, Math, Or};
+    match op {
+        Comma => Some(0),
+        Or => Some(1),
+        And => Some(2),
+        Alt => Some(3),
+        Math(Add | Sub) => Some(4),
+        Math(Mul | Div) => Some(5),
+        Math(Rem) => Some(6),
+        _ => None,
+    }
+}
+
+fn destructure_alts<'s>(
+    l: parse::Term<&'s str>,
+    alts: Vec<parse::Pattern<&'s str>>,
+    r: parse::Term<&'s str>,
+) -> parse::Term<&'s str> {
+    use parse::{BinaryOp, Pattern, Term};
+    const VALUE: &str = "$?//";
+    let mut vars: Vec<&str> = Vec::new();
+    for x in alts.iter().flat_map(Pattern::vars) {
+        if !vars.contains(x) {
+            vars.push(x);
+        }
+    }
+    let bind = |t: Term<&'s str>, pat: Pattern<&'s str>, body: Term<&'s str>| {
+        Term::BinOp(Box::new(t), BinaryOp::Pipe(Some(pat)), Box::new(body))
+    };
+    let branch = |pat: Pattern<&'s str>| {
+        let own: Vec<&str> = pat.vars().copied().collect();
+        let missing = vars.iter().rev().filter(|x| !own.contains(x));
+        let body = missing.fold(r.clone(), |body, x| {
+            bind(Term::Call("null", Vec::new()), Pattern::Var(x), body)
+        });
+        bind(Term::Var(VALUE), pat, body)
+    };
+    let mut alts = alts.into_iter().rev();
+    let last = alts.next().map_or_else(|| r.clone(), branch);
+    let chain = alts.fold(last, |catch, pat| {
+        Term::TryCatch(Box::new(branch(pat)), Some(Box::new(catch)))
+    });
+    bind(l, Pattern::Var(VALUE), chain)
 }

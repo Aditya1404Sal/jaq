@@ -152,4 +152,33 @@ pub trait ValT:
     ///
     /// This is used by `"\(v)"`.
     fn into_string(self) -> Self;
+
+    /// The value's kind as jq names it in messages: `null`, `boolean`, `number`, `string`,
+    /// `array` or `object`.
+    fn kind_name(&self) -> &'static str {
+        "value"
+    }
+
+    /// The value as jq shows it in a message (`jv_dump_string_trunc`).
+    fn dump_trunc(&self) -> alloc::string::String {
+        alloc::string::ToString::to_string(self)
+    }
+
+    /// jq's `type_error`: `KIND (VALUE) MESSAGE`.
+    fn type_error(&self, message: &str) -> crate::Error<Self> {
+        crate::Error::str(format_args!(
+            "{} ({}) {message}",
+            self.kind_name(),
+            self.dump_trunc()
+        ))
+    }
+
+    /// jq's error for iterating over a value that is neither an array nor an object.
+    fn iterate_error(&self) -> crate::Error<Self> {
+        crate::Error::str(format_args!(
+            "Cannot iterate over {} ({})",
+            self.kind_name(),
+            self.dump_trunc()
+        ))
+    }
 }

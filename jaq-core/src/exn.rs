@@ -23,6 +23,8 @@ pub(crate) enum Inner<'a, V> {
     TailCall(Box<(&'a TermId, Vars<V>, CallInput<V>)>),
     Break(usize),
     Halt(i32),
+    /// Evaluation went below the stack floor (see [`crate::depth`]).
+    TooDeep,
 }
 
 #[derive(Clone, Debug)]
@@ -62,6 +64,17 @@ impl<V> Exn<'_, V> {
             Inner::Halt(code) => Ok(code),
             _ => Err(self),
         }
+    }
+
+    /// Create the exception for evaluation that went below the stack floor (see
+    /// [`crate::depth`]). Like a halt, `try` does not catch it.
+    pub fn too_deep() -> Self {
+        Self(Inner::TooDeep)
+    }
+
+    /// Whether the exception is that of evaluation that went below the stack floor.
+    pub fn is_too_deep(&self) -> bool {
+        matches!(self.0, Inner::TooDeep)
     }
 
     /// Create an exception intended to halt filter execution.

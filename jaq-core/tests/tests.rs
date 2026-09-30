@@ -15,7 +15,8 @@ fn update_assign() {
 
 // here, jaq diverges from jq, which returns [3,6,4,8]!
 // idem for other arithmetic operations
-yields!(cartesian_arith, "[(1,2) * (3,4)]", [3, 4, 6, 8]);
+// jq runs a binary operator's right operand outermost
+yields!(cartesian_arith, "[(1,2) * (3,4)]", [3, 6, 4, 8]);
 
 #[test]
 fn add() {
@@ -54,7 +55,8 @@ fn mul() {
     give(json!("Hello"), "2 * .", json!("HelloHello"));
     give(json!(2), ". * \"Hello\"", json!("HelloHello"));
 
-    give(json!("Hello"), "0 * .", json!(null));
+    // jq 1.8 repeats zero times into an empty string
+    give(json!("Hello"), "0 * .", json!(""));
     give(json!(-1), ". * \"Hello\"", json!(null));
     give(
         json!({"k": {"a": 1, "b": 2}}),
@@ -158,7 +160,7 @@ yields!(interpolation, r#"1 | "yields \(.+1)!""#, "yields 2!");
 yields!(
     interpolation_many,
     r#"2 | ["\(., .+1) \(., .*2)"]"#,
-    ["2 2", "2 4", "3 2", "3 4"]
+    ["2 2", "3 2", "2 4", "3 4"]
 );
 // this does not work in jq, because jq does not allow for defining formatters
 yields!(
@@ -255,12 +257,12 @@ yields!(
 yields!(
     try_catch_short_circuit,
     r#"[try ("1", "2", []["3"], "4") catch .]"#,
-    ["1", "2", r#"cannot index [] with "3""#]
+    ["1", "2", r#"Cannot index array with string ("3")"#]
 );
 yields!(
     try_catch_nested,
     r#"try try []["a"] catch []["b"] catch ."#,
-    r#"cannot index [] with "b""#
+    r#"Cannot index array with string ("b")"#
 );
 yields!(
     try_catch_multi_valued,

@@ -135,6 +135,8 @@ pub enum Pattern<S> {
     Arr(Vec<Self>),
     /// Object
     Obj(Vec<(Term<S>, Self)>),
+    /// Destructuring alternatives, `p1 ?// p2 ?// ...`, as the whole pattern of `... as`
+    Alt(Vec<Self>),
 }
 
 /// Binary operators, such as `|`, `,`, `//`, ...
@@ -165,6 +167,31 @@ pub enum BinaryOp<S> {
     UpdateAlt,
 }
 
+impl Term<&str> {
+    /// Whether jq compiles this term to a constant (its `block_is_const`).
+    ///
+    /// These are literal numbers and strings (no interpolation), `true`, `false`, `null`,
+    /// `$__loc__`, arrays and objects of constants, and arithmetic and comparisons of
+    /// constants, which jq folds (a fold that fails becomes a run-time error).
+    pub(crate) fn is_const(&self) -> bool {
+        match self {
+            Self::Num(_) => true,
+            Self::Str(_, parts) => !parts.iter().any(|p| matches!(p, StrPart::Term(_))),
+            Self::Call(name, args) => args.is_empty() && matches!(*name, "true" | "false" | "null"),
+            Self::Var(x) => *x == "$__loc__",
+            Self::Arr(None) => true,
+            Self::Arr(Some(t)) => t.all_commas(&Self::is_const),
+            Self::Obj(kvs) => kvs.iter().all(|(k, v)| match v {
+                Some(v) => k.is_const() && v.is_const(),
+                // `{$__loc__}`
+                None => matches!(k, Self::Var("$__loc__")),
+            }),
+            Self::BinOp(l, BinaryOp::Math(_) | BinaryOp::Cmp(_), r) => l.is_const() && r.is_const(),
+            _ => false,
+        }
+    }
+}
+
 impl<S> Term<S> {
     #[cfg(feature = "std")]
     pub(crate) fn as_str(&self) -> Option<&S> {
@@ -180,6 +207,14 @@ impl<S> Term<S> {
         Self::Str(None, [StrPart::Str(s)].into())
     }
 
+    /// Whether every element of a comma-separated sequence satisfies `f`.
+    fn all_commas(&self, f: &impl Fn(&Self) -> bool) -> bool {
+        match self {
+            Self::BinOp(l, BinaryOp::Comma, r) => l.all_commas(f) && r.all_commas(f),
+            t => f(t),
+        }
+    }
+
     /// `{}[]` returns zero values.
     pub(crate) fn empty() -> Self {
         // `[]`
@@ -193,13 +228,19 @@ impl<S> Term<S> {
     /// Perform precedence climbing of a term followed by operator-term pairs.
     ///
     /// Ensures that `... as $x | ...` is handled like `... as $x | (...)`.
-    fn climb(self, tail: &mut impl Iterator<Item = (BinaryOp<S>, Self)>) -> Self {
-        let tail = core::iter::from_fn(|| {
-            tail.next().map(|(op, tm)| match op {
-                BinaryOp::Pipe(Some(_)) => (op, tm.climb(tail)),
-                _ => (op, tm),
-            })
-        });
+    fn climb(self, mut tail: Vec<(BinaryOp<S>, Self)>) -> Self {
+        // Fold each binding with everything after it, from the last binding back, so that a
+        // chain of bindings is parsed without recursing once per binding.
+        let mut i = tail.len();
+        while i > 0 {
+            i -= 1;
+            if matches!(tail[i].0, BinaryOp::Pipe(Some(_))) {
+                let rest = tail.split_off(i + 1);
+                if let Some((op, tm)) = tail.pop() {
+                    tail.push((op, prec_climb::climb(tm, rest)));
+                }
+            }
+        }
         prec_climb::climb(self, tail)
     }
 }
@@ -210,6 +251,7 @@ impl<S> Pattern<S> {
             Pattern::Var(x) => Box::new(core::iter::once(x)),
             Pattern::Arr(a) => Box::new(a.iter().flat_map(|p| p.vars())),
             Pattern::Obj(o) => Box::new(o.iter().flat_map(|(_k, p)| p.vars())),
+            Pattern::Alt(ps) => Box::new(ps.iter().flat_map(|p| p.vars())),
         }
     }
 }
@@ -359,8 +401,17 @@ impl<'s, 't> Parser<'s, 't> {
                 "|" => BinaryOp::Pipe(None),
                 "as" => {
                     let x = p.pattern()?;
+                    let mut alts = Vec::new();
+                    while p.destructuring_alt() {
+                        alts.push(p.pattern()?);
+                    }
                     p.just("|")?;
-                    BinaryOp::Pipe(Some(x))
+                    if alts.is_empty() {
+                        BinaryOp::Pipe(Some(x))
+                    } else {
+                        alts.insert(0, x);
+                        BinaryOp::Pipe(Some(Pattern::Alt(alts)))
+                    }
                 }
                 "," if with_comma => BinaryOp::Comma,
                 "+" => BinaryOp::Math(Math::Add),
@@ -427,6 +478,22 @@ impl<'s, 't> Parser<'s, 't> {
         }
     }
 
+    /// Consume jq's `?//` (one token in jq, `?` then `//` here), if it comes next.
+    fn destructuring_alt(&mut self) -> bool {
+        let mut i = self.i.clone();
+        match (i.next(), i.next()) {
+            (Some(Token(q, Tok::Sym)), Some(Token(alt, Tok::Sym)))
+                if *q == "?"
+                    && *alt == "//"
+                    && q.as_ptr() as usize + 1 == alt.as_ptr() as usize =>
+            {
+                self.i = i;
+                true
+            }
+            _ => false,
+        }
+    }
+
     fn var(&mut self) -> Result<'s, 't, &'s str> {
         match self.i.next() {
             Some(Token(x, Tok::Var)) => Ok(*x),
@@ -462,7 +529,7 @@ impl<'s, 't> Parser<'s, 't> {
         while let Some(op) = self.op(with_comma)? {
             tail.push((op, self.atom()?))
         }
-        Ok(head.climb(&mut tail.into_iter()))
+        Ok(head.climb(tail))
     }
 
     /// Parse an atomic term.

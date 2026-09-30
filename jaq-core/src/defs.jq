@@ -25,15 +25,45 @@ def until(cond; update): def rec: if cond then . else update | rec end; rec;
 # Paths
 def paths:    skip(1; path      (..));
 def paths(p): skip(1; path_value(..)) | if .[1] | p then .[0] else empty end;
-def getpath($path): reduce $path[] as $p (.; .[$p]);
+def getpath($path):
+  if $path | . >= [] and . < {} then reduce $path[] as $p (.; .[$p])
+  else error("Path must be specified as an array") end;
 def setpath($path; $x): getpath($path) = $x;
-def delpaths($paths): reduce $paths[] as $path (.; getpath($path) |= empty);
 
 # Updates
 def map(f): [.[] | f];
+# Deleting multiple paths one at a time, in the order they were given, is only correct if
+# an earlier deletion never shifts where a later one needs to land — false the moment two
+# paths share an array prefix (`del(.[0,2])`: removing index 0 first turns the old index 2
+# into the new index 1). Descending order avoids that: the highest index under any shared
+# prefix always goes first, so nothing still to be deleted has moved by the time its turn
+# comes (matches jq's own `delpaths`, verified against the oracle for both plain and
+# nested multi-index deletes). Sorted by insertion (using `map`/`select`, defined just
+# above) rather than a call to `sort`/`reverse`: those are jaq-std natives, unavailable to
+# this (jaq-core) definition file — and this is defined here, not down with the rest of
+# "Paths" above, because it needs `map` to already exist.
+def delpaths($paths):
+  if $paths | . >= [] and . < {} | not then error("Paths must be specified as an array") end |
+  reduce $paths[] as $p (.;
+    if $p | . >= [] and . < {} then . else
+      ($p | if . < false then "null" elif . == true or . == false then "boolean"
+       elif . < "" then "number" elif . < [] then "string" else "object" end) as $kind
+      | error("Path must be specified as array, not \($kind)")
+    end) |
+  # deleting the whole value leaves null
+  if $paths | map(select(. == [])) != [] then [][0] else
+  # a path through a missing value deletes nothing, as in jq
+  reduce ($paths | reduce .[] as $p ([]; map(select(. > $p)) + [$p] + map(select(. <= $p))))[]
+    as $path (.; if $path[1:] != [] and getpath($path[:-1]) == [][0] then .
+      else getpath($path) |= empty end) end;
 def map_values(f): .[] |= f;
 def walk(f): .. |= f;
-def del(f): f |= empty;
+# `f |= empty` (the previous definition) applies each of `f`'s paths against the
+# *already-updated* value as it goes, hitting the same shift problem `delpaths` does —
+# `del(.[0,2])` deleted old index 2 by that point, not old index 3. Collecting every path
+# first with `path(f)`, then deleting them all via `delpaths` (already ordered to avoid
+# the shift), matches jq's own definition.
+def del(f): delpaths([path(f)]);
 
 # Arrays
 def first:  .[ 0];
@@ -43,12 +73,10 @@ def join($s): .[] |= tostring | .[:-1][] += $s | reduce .[] as $x (""; . + $x);
 def combinations: .[][] |= [.] | reduce .[] as $a ([]; . + $a[]);
 def combinations($n): [limit($n; repeat(.))] | combinations;
 
-def nth(n; g): first(skip(n; g));
+def nth($n; g): if $n < 0 then error("nth doesn't support negative indices") else first(skip($n; g)) end;
 
 # Objects <-> Arrays
 def   to_entries: [key_values[] as [$key, $value] | { $key, $value }];
-def from_entries: reduce (.[] | { (.key): .value }) as $x ({}; . + $x);
-def with_entries(f): to_entries | map(f) | from_entries;
 
 # Predicates
 def isempty(g): first((g | false), true);

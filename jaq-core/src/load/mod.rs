@@ -413,6 +413,20 @@ fn parse_defs(code: &str) -> Result<parse::Module<&str, Vec<Def<&str>>>, Error<&
         .map_err(|e| Error::Parse(e.into_iter().map(conv_err).collect()))
 }
 
+/// Whether `code` is a term that jq compiles to a constant (`block_is_const`), folding it as jq's
+/// parser does: jq refuses a constant object key that is not a string, and module metadata that
+/// is not a constant object, before running anything. `false` for text that is not a term.
+///
+/// ~~~
+/// # use jaq_core::load::is_const_term;
+/// assert!(is_const_term("[1, {a: 1 + 1}]"));
+/// assert!(!is_const_term("-1"));
+/// assert!(!is_const_term("1,"));
+/// ~~~
+pub fn is_const_term(code: &str) -> bool {
+    parse(code, |p| p.term()).map_or(false, |term: Term<&str>| term.is_const())
+}
+
 /// Lex a string and parse resulting tokens, returning [`None`] if any error occurred.
 ///
 /// Example:

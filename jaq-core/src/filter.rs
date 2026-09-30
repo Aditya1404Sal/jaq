@@ -1,6 +1,8 @@
 //! Filter execution.
 
-use crate::box_iter::{self, box_once, flat_map_then, flat_map_then_with, flat_map_with, map_with};
+use crate::box_iter::{
+    self, box_once, flat_map_then, flat_map_then_with, flat_map_with, levels, map_with,
+};
 use crate::compile::{Bind, CallType, Fold, Pattern, Term as Ast, TermId as Id};
 use crate::data::{DataT, HasLut};
 use crate::fold::fold;
@@ -193,18 +195,124 @@ fn bind_pat<'a, D: DataT>(
     }
 }
 
+/// Bind the elements of a pattern in turn, without recursing once per element.
 fn bind_pats<'a, D: DataT>(
     pats: &'a [(Id, Pattern<Id>)],
     ctx: Ctx<'a, D>,
     cv: Cv<'a, D>,
 ) -> ValXs<'a, Ctx<'a, D>, D::V<'a>> {
-    match pats.split_first() {
-        None => box_once(Ok(ctx)),
-        Some((pat, [])) => bind_pat(pat, ctx, cv),
-        Some((pat, rest)) => flat_map_then_with(bind_pat(pat, ctx, cv.clone()), cv, |ctx, cv| {
-            bind_pats(rest, ctx, cv)
-        }),
+    match pats {
+        [] => box_once(Ok(ctx)),
+        [pat] => bind_pat(pat, ctx, cv),
+        [first, ..] => {
+            let first = bind_pat(first, ctx, cv.clone());
+            levels(first, pats.len(), move |k, ctx| match ctx {
+                Err(e) => box_once(Err(e)),
+                Ok(ctx) => bind_pat(&pats[k + 1], ctx, cv.clone()),
+            })
+        }
     }
+}
+
+/// Run a [`Ast::Pipeline`]: its stages in turn, then its last filter, without recursing once
+/// per stage. A stage without pattern runs as `f | ...`; one with a pattern binds its variables
+/// as `f as $x | ...`, passing its input on.
+fn pipeline<'a, D: DataT, T: Clone + 'a>(
+    stages: &'a [(Id, Option<Pattern<Id>>)],
+    last: &'a Id,
+    cv: Cv<'a, D, T>,
+    run: IdRunFn<'a, D, T>,
+    proj: fn(&T) -> D::V<'a>,
+) -> ValXs<'a, T, D::V<'a>> {
+    let states = levels(box_once(Ok(cv)), stages.len() + 1, move |k, s| match s {
+        Err(e) => box_once(Err(e)),
+        Ok((ctx, t)) => match &stages[k] {
+            (f, None) => map_with(run(f, (ctx.clone(), t)), ctx, |y, ctx| y.map(|y| (ctx, y))),
+            (l, Some(pat)) => {
+                let ctxs = run_and_bind(l, (ctx, proj(&t)), pat);
+                map_with(ctxs, t, |ctx, t| ctx.map(|ctx| (ctx, t)))
+            }
+        },
+    });
+    flat_map_then(states, move |cv| run(last, cv))
+}
+
+/// Update through a [`Ast::Pipeline`], as through the nested pipes it stands for.
+fn pipeline_update<'a, D: DataT>(
+    stages: &'a [(Id, Option<Pattern<Id>>)],
+    last: &'a Id,
+    cv: Cv<'a, D>,
+    f: BoxUpdate<'a, D::V<'a>>,
+) -> ValXs<'a, D::V<'a>> {
+    match stages.split_first() {
+        None => last.update(cv, f),
+        Some(((l, None), rest)) => l.update(
+            (cv.0.clone(), cv.1),
+            Box::new(move |v| pipeline_update(rest, last, (cv.0.clone(), v), f.clone())),
+        ),
+        Some(((l, Some(pat)), rest)) => reduce(
+            run_and_bind(l, (cv.0, cv.1.clone()), pat),
+            cv.1,
+            move |ctx, v| pipeline_update(rest, last, (ctx, v), f.clone()),
+        ),
+    }
+}
+
+/// Run `l op r` as jq does: for each output of `r`, every output of `l`, so that an error in `r`
+/// is raised before `l` runs.
+fn binop<'a, D: DataT>(
+    l: &'a Id,
+    r: &'a Id,
+    cv: Cv<'a, D>,
+    op: impl Fn(D::V<'a>, D::V<'a>) -> ValR<D::V<'a>> + Clone + 'a,
+) -> ValXs<'a, D::V<'a>> {
+    flat_map_then_with(r.run(cv.clone()), cv, move |y, cv| {
+        let op = op.clone();
+        Box::new(l.run(cv).map(move |x| Ok(op(x?, y.clone())?)))
+    })
+}
+
+/// Run a [`Ast::MathChain`] as the nested `Math` it stands for, without recursing once per
+/// operator: as jq does, the last operand's outputs are the outermost loop and the first
+/// operand's the innermost, and an operand's error ends its path before the operands left of it
+/// run.
+fn math_chain<'a, D: DataT>(
+    first: &'a Id,
+    rest: &'a [(crate::ops::Math, Id)],
+    cv: Cv<'a, D>,
+) -> ValXs<'a, D::V<'a>> {
+    let count = rest.len() + 1;
+    // the operand run at level `j`: the last at level 0, the first at the last level
+    let operand = move |j: usize| match count - 1 - j {
+        0 => first,
+        k => &rest[k - 1].1,
+    };
+    let last = map_with(operand(0).run(cv.clone()), (), |y, ()| {
+        y.map(|y| alloc::vec::Vec::from([y]))
+    });
+    // the values chosen so far, from the last operand's on
+    let chosen = levels(last, count, move |j, vs| match vs {
+        Err(e) => box_once(Err(e)),
+        Ok(vs) => map_with(operand(j + 1).run(cv.clone()), vs, |x, mut vs| {
+            x.map(|x| {
+                vs.push(x);
+                vs
+            })
+        }),
+    });
+    Box::new(chosen.map(move |vs| {
+        let mut vs = vs?;
+        let mut acc = vs
+            .pop()
+            .ok_or_else(|| Exn::from(Error::str("empty chain")))?;
+        for (op, _) in rest.iter() {
+            let y = vs
+                .pop()
+                .ok_or_else(|| Exn::from(Error::str("empty chain")))?;
+            acc = op.run(acc, y)?;
+        }
+        Ok(acc)
+    }))
 }
 
 fn run_and_bind<'a, D: DataT>(
@@ -395,12 +503,30 @@ fn lazy_is_lazy() {
 }
 
 /// Runs `def recurse(f): ., (f? | recurse(f)); v | recurse(f)`.
+///
+/// This walks the values depth-first on a heap-allocated stack of iterators, so a deeply nested
+/// value does not make it recurse.
 fn recurse_run<'a, T: Clone + 'a, V: 'a, I: Iterator<Item = ValR<T, V>> + 'a>(
     x: T,
     f: &'a impl Fn(T) -> I,
 ) -> ValXs<'a, T, V> {
-    let id = core::iter::once(Ok(x.clone()));
-    Box::new(id.chain(f(x).flatten().flat_map(|y| recurse_run(y, f))))
+    let mut stack: alloc::vec::Vec<box_iter::BoxIter<'a, T>> = alloc::vec::Vec::new();
+    let mut first = Some(x);
+    Box::new(core::iter::from_fn(move || {
+        let y = match first.take() {
+            Some(x) => x,
+            None => loop {
+                match stack.last_mut()?.next() {
+                    Some(y) => break y,
+                    None => {
+                        stack.pop();
+                    }
+                }
+            },
+        };
+        stack.push(Box::new(f(y.clone()).flatten()));
+        Some(Ok(y))
+    }))
 }
 
 /// Runs `def recurse: (.[]? | recurse), .; v | recurse |= f`.
@@ -413,6 +539,9 @@ fn recurse_run<'a, T: Clone + 'a, V: 'a, I: Iterator<Item = ValR<T, V>> + 'a>(
 /// trying to update values that have been deleted.
 fn recurse_update<'a, V: ValT + 'a>(v: V, f: &dyn Update<'a, V>) -> ValXs<'a, V> {
     use crate::path::Opt::Optional;
+    if crate::depth::exhausted() {
+        return box_once(Err(Exn::too_deep()));
+    }
     box_iter::then(v.map_values(Optional, |v| recurse_update(v, f)), f)
 }
 
@@ -463,6 +592,9 @@ impl Id {
     /// `f.run((c, v))` returns the output of `v | f` in the context `c`.
     pub fn run<'a, D: DataT>(&self, cv: Cv<'a, D>) -> ValXs<'a, D::V<'a>> {
         use core::iter::once;
+        if crate::depth::exhausted() {
+            return box_once(Err(Exn::too_deep()));
+        }
         match &cv.0.lut().terms[self.0] {
             Ast::Id => box_once(Ok(cv.1)),
             Ast::Recurse => recurse_run(cv.1, &|v| v.values()),
@@ -537,10 +669,11 @@ impl Id {
                     Box::new(r.run(cv).map(|r| Ok(D::V::from(r?.as_bool()))))
                 }
             }),
-            Ast::Math(l, op, r) => Box::new(cartesian(l, r, cv).map(|(x, y)| Ok(op.run(x?, y?)?))),
-            Ast::Cmp(l, op, r) => {
-                Box::new(cartesian(l, r, cv).map(|(x, y)| Ok(D::V::from(op.run(&x?, &y?)))))
-            }
+            Ast::Math(l, op, r) => binop(l, r, cv, move |x, y| op.run(x, y)),
+            Ast::Merge(l, r) => Box::new(cartesian(l, r, cv).map(|(x, y)| Ok((x? + y?)?))),
+            Ast::MathChain(first, rest) => math_chain(first, rest, cv),
+            Ast::Pipeline(stages, last) => pipeline(stages, last, cv, Id::run, Clone::clone),
+            Ast::Cmp(l, op, r) => binop(l, r, cv, move |x, y| Ok(D::V::from(op.run(&x, &y)))),
 
             Ast::Fold(xs, pat, init, update, fold_type) => {
                 let xs = rc_lazy_list::List::from_iter(run_and_bind(xs, cv.clone(), pat));
@@ -576,6 +709,9 @@ impl Id {
     /// In particular, `v | path(f)` in context `c` yields the same paths as
     /// `f.paths((c, (v, Default::default())))`.
     pub fn paths<'a, D: DataT>(&self, cv: Cvp<'a, D>) -> ValPathXs<'a, D::V<'a>> {
+        if crate::depth::exhausted() {
+            return box_once(Err(Exn::too_deep()));
+        }
         let err = |v| box_once(Err(Exn::from(Error::path_expr(v))));
         let proj_cv = |cv: &Cvp<'a, D>| (cv.0.clone(), cv.1 .0.clone());
         let proj_val = |(val, _path): &(D::V<'a>, _)| val.clone();
@@ -584,6 +720,8 @@ impl Id {
             Ast::Int(_) | Ast::Num(_) | Ast::Str(_) => err(cv.1 .0),
             Ast::Arr(_) | Ast::ObjEmpty | Ast::ObjSingle(..) => err(cv.1 .0),
             Ast::Neg(_) | Ast::Logic(..) | Ast::Math(..) | Ast::Cmp(..) => err(cv.1 .0),
+            Ast::MathChain(..) | Ast::Merge(..) => err(cv.1 .0),
+            Ast::Pipeline(stages, last) => pipeline(stages, last, cv, Id::paths, proj_val),
             Ast::Update(..) | Ast::Assign(..) => err(cv.1 .0),
             Ast::UpdateMath(..) | Ast::UpdateAlt(..) => err(cv.1 .0),
             Ast::Id => box_once(Ok(cv.1)),
@@ -662,12 +800,17 @@ impl Id {
         cv: Cv<'a, D>,
         f: BoxUpdate<'a, D::V<'a>>,
     ) -> ValXs<'a, D::V<'a>> {
+        if crate::depth::exhausted() {
+            return box_once(Err(Exn::too_deep()));
+        }
         let err = |v| box_once(Err(Exn::from(Error::path_expr(v))));
         match &cv.0.lut().terms[self.0] {
             Ast::ToString => err(cv.1),
             Ast::Int(_) | Ast::Num(_) | Ast::Str(_) => err(cv.1),
             Ast::Arr(_) | Ast::ObjEmpty | Ast::ObjSingle(..) => err(cv.1),
             Ast::Neg(_) | Ast::Logic(..) | Ast::Math(..) | Ast::Cmp(..) => err(cv.1),
+            Ast::MathChain(..) | Ast::Merge(..) => err(cv.1),
+            Ast::Pipeline(stages, last) => pipeline_update(stages, last, cv, f),
             Ast::Update(..) | Ast::Assign(..) => err(cv.1),
             Ast::UpdateMath(..) | Ast::UpdateAlt(..) => err(cv.1),
             // jq implements updates on `try ... catch` and `label`, but

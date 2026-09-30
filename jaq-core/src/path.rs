@@ -1,6 +1,6 @@
 //! Paths and their parts.
 
-use crate::box_iter::{box_once, flat_map_with, map_with, then, BoxIter};
+use crate::box_iter::{box_once, flat_map_with, levels, map_with, BoxIter};
 use crate::val::{ValRs, ValT, ValX, ValXs};
 use crate::RcList;
 use alloc::{boxed::Box, vec::Vec};
@@ -57,20 +57,22 @@ impl<'a, U: Clone + 'a, E: Clone + 'a, T: Clone + IntoIterator<Item = Result<U, 
 }
 
 impl<'a, U: Clone + 'a> Path<U> {
-    fn combinations<I, F>(self, mut iter: I) -> BoxIter<'a, Self>
+    /// Every path made of one alternative of each part, extending `self`, without recursing
+    /// once per part.
+    fn combinations<I, F>(self, iter: I) -> BoxIter<'a, Self>
     where
         I: Iterator<Item = (Part<F>, Opt)> + Clone + 'a,
         F: IntoIterator<Item = U> + Clone + 'a,
     {
-        if let Some((part, opt)) = iter.next() {
-            let parts = part.into_iter();
-            flat_map_with(parts, (self, iter), move |part, (mut prev, iter)| {
+        let parts: Vec<_> = iter.collect();
+        let count = parts.len() + 1;
+        levels(box_once(self), count, move |k, prev| {
+            let (part, opt) = parts[k].clone();
+            map_with(part.into_iter(), prev, move |part, mut prev| {
                 prev.0.push((part, opt));
-                prev.combinations(iter)
+                prev
             })
-        } else {
-            box_once(self)
-        }
+        })
     }
 }
 
@@ -96,18 +98,22 @@ impl<'a, V: ValT + 'a> Path<V> {
     }
 }
 
-fn run<'a, V: 'a, T: 'a>(
-    mut iter: impl Iterator<Item = (Part<V>, Opt)> + Clone + 'a,
+/// Apply the path parts in turn, without recursing once per part.
+fn run<'a, V: Clone + 'a, T: 'a>(
+    iter: impl Iterator<Item = (Part<V>, Opt)> + Clone + 'a,
     val: T,
     f: fn(Part<V>, T) -> ValRs<'a, T, V>,
 ) -> ValRs<'a, T, V> {
-    if let Some((part, opt)) = iter.next() {
-        let essential = matches!(opt, Opt::Essential);
-        let ys = f(part, val).filter(move |v| essential || v.is_ok());
-        flat_map_with(ys, iter, move |v, iter| then(v, |v| run(iter, v, f)))
-    } else {
-        box_once(Ok(val))
-    }
+    let parts: Vec<_> = iter.collect();
+    let count = parts.len() + 1;
+    levels(box_once(Ok(val)), count, move |k, v| match v {
+        Err(e) => box_once(Err(e)),
+        Ok(v) => {
+            let (part, opt) = parts[k].clone();
+            let essential = matches!(opt, Opt::Essential);
+            Box::new(f(part, v).filter(move |v| essential || v.is_ok()))
+        }
+    })
 }
 
 fn update<'a, V: ValT + 'a, P, F>(mut iter: P, last: (Part<V>, Opt), v: V, f: &F) -> ValX<'a, V>
@@ -115,6 +121,9 @@ where
     P: Iterator<Item = (Part<V>, Opt)> + Clone,
     F: Fn(V) -> ValXs<'a, V>,
 {
+    if crate::depth::exhausted() {
+        return Err(crate::Exn::too_deep());
+    }
     if let Some((part, opt)) = iter.next() {
         use core::iter::once;
         part.update(v, opt, |v| once(update(iter.clone(), last.clone(), v, f)))
