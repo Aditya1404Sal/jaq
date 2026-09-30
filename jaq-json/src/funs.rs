@@ -1,12 +1,24 @@
-use crate::{read, Error, Val, ValR, ValX};
+use crate::{jv_parse, Error, Val, ValR};
 use alloc::{boxed::Box, vec::Vec};
 use bstr::ByteSlice;
 use bytes::{BufMut, Bytes, BytesMut};
-use core::fmt;
-use jaq_core::box_iter::{then, BoxIter};
+use jaq_core::box_iter::BoxIter;
 use jaq_core::native::{bome, run, unary, v, Filter, Fun};
-use jaq_core::{DataT, Exn, RunPtr};
+use jaq_core::{DataT, RunPtr};
 use jaq_std::ValT as _;
+
+/// jq's value kinds, where `true` and `false` are two.
+fn jq_kind(v: &Val) -> u8 {
+    match v {
+        Val::Null => 0,
+        Val::Bool(false) => 1,
+        Val::Bool(true) => 2,
+        Val::Num(_) => 3,
+        Val::TStr(_) | Val::BStr(_) => 4,
+        Val::Arr(_) => 5,
+        Val::Obj(_) => 6,
+    }
+}
 
 impl Val {
     /// Return 0 for null, the absolute value for numbers, and
@@ -21,7 +33,7 @@ impl Val {
             Val::BStr(b) => Ok(Val::from(b.len())),
             Val::Arr(a) => Ok(Val::from(a.len())),
             Val::Obj(o) => Ok(Val::from(o.len())),
-            Val::Bool(_) => Err(Error::str(format_args!("{self} has no length"))),
+            Val::Bool(_) => Err(crate::type_error(self, "has no length")),
         }
     }
 
@@ -43,13 +55,13 @@ impl Val {
             (Val::Arr(_), Val::Arr(y)) if y.is_empty() => Ok(Box::new(core::iter::empty())),
             (Val::Arr(x), Val::Arr(y)) => {
                 let iw = x.windows(y.len()).enumerate();
-                Ok(Box::new(iw.filter_map(|(i, w)| (w == **y).then_some(i))))
+                Ok(Box::new(iw.filter_map(|(i, w)| (w == &y[..]).then_some(i))))
             }
             (Val::Arr(x), y) => {
                 let ix = x.iter().enumerate();
                 Ok(Box::new(ix.filter_map(move |(i, x)| (x == y).then_some(i))))
             }
-            (x, y) => Err(Error::index(x.clone(), y.clone())),
+            (x, y) => Err(crate::index_type_error(x, y)),
         }
     }
 
@@ -59,15 +71,81 @@ impl Val {
     /// * for every key-value pair `k, v` in `b`,
     ///   there is a key-value pair `k, v'` in `a` such that `v'` contains `v`, or
     /// * `a` equals `b`.
+    ///
+    /// This decides on a stack of pending checks rather than recursing once per level of nesting.
     fn contains(&self, other: &Self) -> bool {
-        match (self, other) {
-            (Self::BStr(l), Self::BStr(r)) | (Self::TStr(l), Self::TStr(r)) => l.contains_str(&**r),
-            (Self::Arr(l), Self::Arr(r)) => r.iter().all(|r| l.iter().any(|l| l.contains(r))),
-            (Self::Obj(l), Self::Obj(r)) => r
-                .iter()
-                .all(|(k, r)| l.get(k).is_some_and(|l| l.contains(r))),
-            _ => self == other,
+        /// A check under way: whether every one of `rs` is contained in some element of `l`
+        /// (an array) or in the value at the same key (an object), or whether some element of
+        /// `ls` contains `r`.
+        enum Frame<'a> {
+            All(&'a Val, alloc::vec::IntoIter<(Option<&'a Val>, &'a Val)>),
+            Any(core::slice::Iter<'a, Val>, &'a Val),
         }
+        // Whether `l` contains `r` without looking into elements, or the frame that decides it.
+        fn start<'a>(l: &'a Val, r: &'a Val) -> Result<bool, Frame<'a>> {
+            match (l, r) {
+                (Val::BStr(l), Val::BStr(r)) | (Val::TStr(l), Val::TStr(r)) => {
+                    Ok(l.contains_str(&**r))
+                }
+                (Val::Arr(_), Val::Arr(rs)) => {
+                    let rs: alloc::vec::Vec<_> = rs.iter().map(|r| (None, r)).collect();
+                    Err(Frame::All(l, rs.into_iter()))
+                }
+                (Val::Obj(ls), Val::Obj(rs)) => {
+                    let rs: alloc::vec::Vec<_> = rs.iter().map(|(k, r)| (ls.get(k), r)).collect();
+                    Err(Frame::All(l, rs.into_iter()))
+                }
+                _ => Ok(l == r),
+            }
+        }
+        let mut stack = match start(self, other) {
+            Ok(b) => return b,
+            Err(frame) => alloc::vec::Vec::from([frame]),
+        };
+        // the answer of the check that just ended, for the one that waits on it
+        let mut answer: Option<bool> = None;
+        while let Some(frame) = stack.last_mut() {
+            let next = match frame {
+                Frame::All(_, _) if answer == Some(false) => {
+                    stack.pop();
+                    continue;
+                }
+                Frame::Any(_, _) if answer == Some(true) => {
+                    stack.pop();
+                    continue;
+                }
+                Frame::All(l, rs) => match rs.next() {
+                    None => {
+                        answer = Some(true);
+                        stack.pop();
+                        continue;
+                    }
+                    // an object's entry: the value at the same key must contain it
+                    Some((Some(l), r)) => start(l, r),
+                    Some((None, r)) => match l {
+                        Val::Arr(ls) => Err(Frame::Any(ls.iter(), r)),
+                        // a key missing from the object
+                        _ => Ok(false),
+                    },
+                },
+                Frame::Any(ls, r) => match ls.next() {
+                    None => {
+                        answer = Some(false);
+                        stack.pop();
+                        continue;
+                    }
+                    Some(l) => start(l, r),
+                },
+            };
+            match next {
+                Ok(b) => answer = Some(b),
+                Err(frame) => {
+                    answer = None;
+                    stack.push(frame);
+                }
+            }
+        }
+        answer.unwrap_or(true)
     }
 
     fn to_bytes(&self) -> Result<Bytes, Self> {
@@ -113,15 +191,6 @@ impl Val {
     }
 }
 
-/// Box Map, Map Error.
-fn bmme<'a>(iter: BoxIter<'a, ValR>) -> BoxIter<'a, ValX<'a>> {
-    Box::new(iter.map(|r| r.map_err(Exn::from)))
-}
-
-fn parse_fail(i: &impl fmt::Display, fmt: &str, e: impl fmt::Display) -> Error {
-    Error::str(format_args!("cannot parse {i} as {fmt}: {e}"))
-}
-
 self_cell::self_cell!(
     struct BytesValRs {
         owner: Bytes,
@@ -152,11 +221,31 @@ pub fn funs<D: for<'a> DataT<V<'a> = Val>>() -> impl Iterator<Item = Fun<D>> {
 
 fn base<D: for<'a> DataT<V<'a> = Val>>() -> Box<[Filter<RunPtr<D>>]> {
     Box::new([
+        // jq 1.8's `fromjson`, `tonumber` and `toboolean`, with its messages.
         ("fromjson", v(0), |cv| {
-            bmme(then(cv.1.try_as_utf8_bytes_owned(), |s| {
-                let fail = move |r: Result<_, _>| r.map_err(|e| parse_fail(&cv.1, "JSON", e));
-                bytes_valrs(s, |s| Box::new(read::parse_many(s).map(fail)))
-            }))
+            bome(match &cv.1 {
+                Val::TStr(s) => jv_parse::parse_sized(s).map_err(Error::str),
+                v => Err(crate::type_error(v, "only strings can be parsed")),
+            })
+        }),
+        ("tonumber", v(0), |cv| {
+            let message = "cannot be parsed as a number";
+            bome(match &cv.1 {
+                Val::Num(_) => Ok(cv.1.clone()),
+                // jq reads the string as a C string: a NUL in it fails.
+                Val::TStr(s) if !s.contains(&0) => jv_parse::number_literal(s)
+                    .map(Val::Num)
+                    .ok_or_else(|| crate::type_error(&cv.1, message)),
+                v => Err(crate::type_error(v, message)),
+            })
+        }),
+        ("toboolean", v(0), |cv| {
+            bome(match &cv.1 {
+                Val::Bool(_) => Ok(cv.1.clone()),
+                Val::TStr(s) if &***s == b"true" => Ok(Val::Bool(true)),
+                Val::TStr(s) if &***s == b"false" => Ok(Val::Bool(false)),
+                v => Err(crate::type_error(v, "cannot be parsed as a boolean")),
+            })
         }),
         ("tojson", v(0), |cv| bome(Ok(Val::utf8_str(cv.1.to_json())))),
         ("tobytes", v(0), |cv| {
@@ -164,11 +253,32 @@ fn base<D: for<'a> DataT<V<'a> = Val>>() -> Box<[Filter<RunPtr<D>>]> {
             bome(cv.1.to_bytes().map(Val::byte_str).map_err(fail))
         }),
         ("length", v(0), |cv| bome(cv.1.length())),
+        // jq checks containment only between values of one kind (`true` and `false` are two).
         ("contains", v(1), |cv| {
-            unary(cv, |x, y| Ok(Val::from(x.contains(&y))))
+            unary(cv, |x, y| {
+                if jq_kind(&x) != jq_kind(&y) {
+                    let message = "cannot have their containment checked";
+                    return Err(crate::type_error2(&x, &y, message));
+                }
+                Ok(Val::from(x.contains(&y)))
+            })
         }),
         ("has", v(1), |cv| {
-            unary(cv, |v, k| v.index_opt(&k).map(|o| o.is_some().into()))
+            unary(cv, |v, k| match (&v, &k) {
+                (Val::Obj(o), Val::TStr(_) | Val::BStr(_)) => Ok(o.contains_key(&k).into()),
+                (Val::Arr(a), Val::Num(n)) => {
+                    // jq truncates the index; NaN and negative indices are never present.
+                    let d = n.as_f64();
+                    #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+                    let present = !d.is_nan() && d > -1.0 && (d as usize) < a.len();
+                    Ok(present.into())
+                }
+                _ => Err(Error::str(format_args!(
+                    "Cannot check whether {} has a {} key",
+                    crate::type_name(&v),
+                    crate::type_name(&k)
+                ))),
+            })
         }),
         ("indices", v(1), |cv| {
             let to_int = |i: usize| Val::from(i as isize);
@@ -177,10 +287,24 @@ fn base<D: for<'a> DataT<V<'a> = Val>>() -> Box<[Filter<RunPtr<D>>]> {
             })
         }),
         ("bsearch", v(1), |cv| {
-            let to_idx = |r: Result<_, _>| r.map_or_else(|i| -1 - i as isize, |i| i as isize);
             unary(cv, move |a, x| {
-                a.as_arr().map(|a| Val::from(to_idx(a.binary_search(&x))))
+                a.as_arr().map(|a| Val::from(bsearch(a, &x)))
             })
         }),
     ])
+}
+
+/// jq's binary search: the index of `x` in `a`, or `-1 - i` for the index `i` it would go at.
+/// On an unsorted array, it finds what jq's own search finds.
+fn bsearch(a: &[Val], x: &Val) -> isize {
+    let (mut start, mut end) = (0, a.len());
+    while start < end {
+        let mid = start + (end - start) / 2;
+        match x.cmp(&a[mid]) {
+            core::cmp::Ordering::Equal => return mid as isize,
+            core::cmp::Ordering::Less => end = mid,
+            core::cmp::Ordering::Greater => start = mid + 1,
+        }
+    }
+    -1 - start as isize
 }

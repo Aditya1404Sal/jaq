@@ -12,6 +12,7 @@ extern crate alloc;
 extern crate std;
 
 mod funs;
+pub mod jv_parse;
 mod num;
 #[macro_use]
 pub mod write;
@@ -24,9 +25,7 @@ use core::cmp::Ordering;
 use core::fmt;
 use core::hash::{Hash, Hasher};
 use jaq_core::box_iter::box_once;
-use jaq_core::{load, ops, path, val, Exn};
-use num_bigint::BigInt;
-use num_traits::{cast::ToPrimitive, Signed};
+use jaq_core::{load, path, val, Exn};
 
 pub use funs::{bytes_valrs, funs};
 pub use num::Num;
@@ -61,9 +60,9 @@ pub enum Val {
     /// replace invalid UTF-8 by the Unicode replacement character.
     TStr(Box<Bytes>),
     /// Array
-    Arr(Rc<Vec<Val>>),
+    Arr(Rc<Array>),
     /// Object
-    Obj(Rc<Map<Val, Val>>),
+    Obj(Rc<Object>),
 }
 
 #[cfg(feature = "sync")]
@@ -81,40 +80,249 @@ const _: () = {
 /// Types and sets of types.
 #[derive(Clone, Debug, PartialEq, Eq)]
 enum Type {
-    /// `[] | .["a"]` or `limit("a"; 0)` or `range(0; "a")`
-    Int,
-    /*
-    /// `"1" | sin` or `pow(2; "3")` or `fma(2; 3; "4")`
-    Float,
-    */
-    /// `-"a"`, `"a" | round`
-    Num,
-    /// `{(0): 1}` or `0 | fromjson` or `0 | explode` or `"a b c" | split(0)`
+    /// `0 | fromjson` or `"a b c" | split(0)`
     Str,
-    /// `0 | sort` or `0 | implode` or `[] | .[0:] = 0`
+    /// `0 | implode`
     Arr,
-    /// `0 | .[]` or `0 | .[0]` or `0 | keys` (array or object)
-    Iter,
-    /// `{}[0:1]` (string or array)
-    Range,
 }
 
 impl Type {
     fn as_str(&self) -> &'static str {
         match self {
-            Self::Int => "integer",
-            //Self::Float => "floating-point number",
-            Self::Num => "number",
             Self::Str => "string",
             Self::Arr => "array",
-            Self::Iter => "iterable (array or object)",
-            Self::Range => "rangeable (array or string)",
         }
     }
 }
 
+/// A value's own jq type name (`type`'s own vocabulary: `null`/`boolean`/`number`/`string`/
+/// `array`/`object`), as opposed to [`Type`] above, which names a *target* type a value failed
+/// to convert to.
+pub(crate) fn type_name(v: &Val) -> &'static str {
+    match v {
+        Val::Null => "null",
+        Val::Bool(_) => "boolean",
+        Val::Num(_) => "number",
+        Val::BStr(_) | Val::TStr(_) => "string",
+        Val::Arr(_) => "array",
+        Val::Obj(_) => "object",
+    }
+}
+
+/// A value in an error message, as jq's `jv_dump_string_trunc` gives it with the 30-byte
+/// buffer its callers use: the compact JSON text, or when that is longer than 29 bytes, its first
+/// 25 (26 without a closing delimiter) bytes, not splitting a character, then `...` and the
+/// closing `"`, `]` or `}`.
+pub fn dump_trunc(v: &Val) -> String {
+    const BUFSIZE: usize = 30;
+    let text = alloc::string::ToString::to_string(v);
+    if text.len() < BUFSIZE {
+        return text;
+    }
+    let delim = match text.as_bytes()[0] {
+        b'"' => Some('"'),
+        b'[' => Some(']'),
+        b'{' => Some('}'),
+        _ => None,
+    };
+    let mut len = BUFSIZE - if delim.is_some() { 5 } else { 4 };
+    while !text.is_char_boundary(len) {
+        len -= 1;
+    }
+    let mut out = String::from(&text[..len]);
+    out.push_str("...");
+    out.extend(delim);
+    out
+}
+
+/// jq's `type_error`: `TYPE (VALUE) MESSAGE`.
+pub(crate) fn type_error(v: &Val, message: &str) -> Error {
+    Error::str(format_args!(
+        "{} ({}) {message}",
+        type_name(v),
+        dump_trunc(v)
+    ))
+}
+
+/// jq's `type_error2`: `KIND (VALUE) and KIND (VALUE) MESSAGE`.
+pub(crate) fn type_error2(l: &Val, r: &Val, message: &str) -> Error {
+    Error::str(format_args!(
+        "{} ({}) and {} ({}) {message}",
+        type_name(l),
+        dump_trunc(l),
+        type_name(r),
+        dump_trunc(r)
+    ))
+}
+
+/// jq's own wording for indexing a value by a key it cannot take — e.g. `{}[0]`, `[][{}]` or
+/// `1 | .a` — is `Cannot index TYPE1 with TYPE2 (VALUE)`, the index's value cut short as
+/// [`dump_trunc`] does. Verified against the oracle for every kind of value and index.
+pub(crate) fn index_type_error(container: &Val, index: &Val) -> Error {
+    Error::str(format_args!(
+        "Cannot index {} with {} ({})",
+        type_name(container),
+        type_name(index),
+        dump_trunc(index)
+    ))
+}
+
+/// An array index as jq's `jv_get` takes it: truncated to an integer (`.[1.5]` is `.[1]`),
+/// with NaN or a value past `int`'s range reading as `null`.
+fn jq_array_index(i: &Num, len: usize) -> Option<usize> {
+    if let Some(i) = i.as_pos_usize() {
+        return abs_index(i, len);
+    }
+    let f = i.as_f64();
+    if f.is_nan() || f.abs() >= 2147483648.0 {
+        return None;
+    }
+    #[allow(clippy::cast_possible_truncation)]
+    let i = f as isize;
+    abs_index(num::PosUsize(i >= 0, i.unsigned_abs()), len)
+}
+
 /// Order-preserving map
 pub type Map<K = Val, V = K> = indexmap::IndexMap<K, V, foldhash::fast::RandomState>;
+
+/// The elements of an array.
+///
+/// This is a vector of values that is dropped without recursing into the arrays and objects it
+/// holds (see [`drop_deep`]), so that a value nested arbitrarily deep, as a filter can build it,
+/// can be dropped.
+#[derive(Clone, Debug, Default, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct Array(Vec<Val>);
+
+/// The entries of an object, dropped as [`Array`] is.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct Object(Map<Val, Val>);
+
+/// Drop values without recursing: the elements of each array or object dropped last are moved
+/// onto an explicit stack first.
+fn drop_deep(mut stack: Vec<Val>) {
+    while let Some(v) = stack.pop() {
+        match v {
+            Val::Arr(a) => {
+                if let Ok(mut a) = Rc::try_unwrap(a) {
+                    stack.append(&mut a.0);
+                }
+            }
+            Val::Obj(o) => {
+                if let Ok(mut o) = Rc::try_unwrap(o) {
+                    stack.extend(
+                        core::mem::take(&mut o.0)
+                            .into_iter()
+                            .flat_map(|(k, v)| [k, v]),
+                    );
+                }
+            }
+            _ => (),
+        }
+    }
+}
+
+const fn is_container(v: &Val) -> bool {
+    matches!(v, Val::Arr(_) | Val::Obj(_))
+}
+
+impl Drop for Array {
+    fn drop(&mut self) {
+        if self.0.iter().any(is_container) {
+            drop_deep(core::mem::take(&mut self.0));
+        }
+    }
+}
+
+impl Drop for Object {
+    fn drop(&mut self) {
+        if self.0.values().any(is_container) {
+            let entries = core::mem::take(&mut self.0);
+            drop_deep(entries.into_iter().flat_map(|(k, v)| [k, v]).collect());
+        }
+    }
+}
+
+impl core::ops::Deref for Array {
+    type Target = Vec<Val>;
+    fn deref(&self) -> &Vec<Val> {
+        &self.0
+    }
+}
+
+impl core::ops::DerefMut for Array {
+    fn deref_mut(&mut self) -> &mut Vec<Val> {
+        &mut self.0
+    }
+}
+
+impl core::ops::Deref for Object {
+    type Target = Map<Val, Val>;
+    fn deref(&self) -> &Map<Val, Val> {
+        &self.0
+    }
+}
+
+impl core::ops::DerefMut for Object {
+    fn deref_mut(&mut self) -> &mut Map<Val, Val> {
+        &mut self.0
+    }
+}
+
+impl From<Vec<Val>> for Array {
+    fn from(v: Vec<Val>) -> Self {
+        Self(v)
+    }
+}
+
+impl From<Map<Val, Val>> for Object {
+    fn from(m: Map<Val, Val>) -> Self {
+        Self(m)
+    }
+}
+
+impl FromIterator<Val> for Array {
+    fn from_iter<I: IntoIterator<Item = Val>>(iter: I) -> Self {
+        Self(iter.into_iter().collect())
+    }
+}
+
+impl FromIterator<(Val, Val)> for Object {
+    fn from_iter<I: IntoIterator<Item = (Val, Val)>>(iter: I) -> Self {
+        Self(iter.into_iter().collect())
+    }
+}
+
+impl IntoIterator for Array {
+    type Item = Val;
+    type IntoIter = alloc::vec::IntoIter<Val>;
+    fn into_iter(mut self) -> Self::IntoIter {
+        core::mem::take(&mut self.0).into_iter()
+    }
+}
+
+impl IntoIterator for Object {
+    type Item = (Val, Val);
+    type IntoIter = indexmap::map::IntoIter<Val, Val>;
+    fn into_iter(mut self) -> Self::IntoIter {
+        core::mem::take(&mut self.0).into_iter()
+    }
+}
+
+impl<'a> IntoIterator for &'a Array {
+    type Item = &'a Val;
+    type IntoIter = core::slice::Iter<'a, Val>;
+    fn into_iter(self) -> Self::IntoIter {
+        self.0.iter()
+    }
+}
+
+impl<'a> IntoIterator for &'a Object {
+    type Item = (&'a Val, &'a Val);
+    type IntoIter = indexmap::map::Iter<'a, Val, Val>;
+    fn into_iter(self) -> Self::IntoIter {
+        self.0.iter()
+    }
+}
 
 /// Error that can occur during filter execution.
 pub type Error = jaq_core::Error<Val>;
@@ -136,7 +344,19 @@ impl jaq_core::ValT for Val {
     }
 
     fn from_map<I: IntoIterator<Item = (Self, Self)>>(iter: I) -> ValR {
-        Ok(Self::obj(iter.into_iter().collect()))
+        let mut map = Map::default();
+        for (k, v) in iter {
+            // jq builds objects with string keys only.
+            if !matches!(k, Val::TStr(_) | Val::BStr(_)) {
+                return Err(Error::str(format_args!(
+                    "Cannot use {} ({}) as object key",
+                    type_name(&k),
+                    dump_trunc(&k)
+                )));
+            }
+            map.insert(k, v);
+        }
+        Ok(Self::obj(map))
     }
 
     fn key_values(self) -> Box<dyn Iterator<Item = Result<(Val, Val), Error>>> {
@@ -144,7 +364,7 @@ impl jaq_core::ValT for Val {
         match self {
             Self::Arr(a) => Box::new(rc_unwrap_or_clone(a).into_iter().enumerate().map(arr_idx)),
             Self::Obj(o) => Box::new(rc_unwrap_or_clone(o).into_iter().map(Ok)),
-            _ => box_once(Err(Error::typ(self, Type::Iter.as_str()))),
+            _ => box_once(Err(jaq_core::ValT::iterate_error(&self))),
         }
     }
 
@@ -152,7 +372,7 @@ impl jaq_core::ValT for Val {
         match self {
             Self::Arr(a) => Box::new(rc_unwrap_or_clone(a).into_iter().map(Ok)),
             Self::Obj(o) => Box::new(rc_unwrap_or_clone(o).into_iter().map(|(_k, v)| Ok(v))),
-            _ => box_once(Err(Error::typ(self, Type::Iter.as_str()))),
+            _ => box_once(Err(jaq_core::ValT::iterate_error(&self))),
         }
     }
 
@@ -161,18 +381,19 @@ impl jaq_core::ValT for Val {
     }
 
     fn range(self, range: val::Range<&Self>) -> ValR {
+        // jq slices null to null.
+        if let Val::Null = self {
+            return Ok(Val::Null);
+        }
         let fs = |b: Bytes, range, skip_take: SkipTakeFn| {
-            Self::range_int(range)
-                .map(|range_char| skip_take(range_char, &b))
-                .map(|(skip, take)| b.slice(skip..skip + take))
+            skip_take(range, &b).map(|(skip, take)| b.slice(skip..skip + take))
         };
         match self {
             Val::BStr(b) => fs(*b, range, skip_take_bytes).map(Val::byte_str),
             Val::TStr(b) => fs(*b, range, skip_take_chars).map(Val::utf8_str),
-            Val::Arr(a) => Self::range_int(range)
-                .map(|range| skip_take(range, a.len()))
+            Val::Arr(a) => slice_bounds(range, a.len())
                 .map(|(skip, take)| a.iter().skip(skip).take(take).cloned().collect()),
-            _ => Err(Error::typ(self, Type::Range.as_str())),
+            _ => Err(index_type_error(&self, &slice_object(range))),
         }
     }
 
@@ -191,7 +412,7 @@ impl jaq_core::ValT for Val {
                 let iter = iter.filter_map(|(k, v)| f(v).next().map(|v| Ok((k, v?))));
                 Ok(Self::obj(iter.collect::<Result<_, Exn<_>>>()?))
             }
-            v => opt.fail(v, |v| Exn::from(Error::typ(v, Type::Iter.as_str()))),
+            v => opt.fail(v, |v| Exn::from(jaq_core::ValT::iterate_error(&v))),
         }
     }
 
@@ -206,6 +427,16 @@ impl jaq_core::ValT for Val {
             return self.map_range(range, opt, f);
         };
         match self {
+            // jq treats null as an empty object or array when updating it by key or index.
+            Val::Null => match index {
+                Val::TStr(_) | Val::BStr(_) => Val::obj(Map::default()).map_index(index, opt, f),
+                Val::Num(_) => Val::Arr(Rc::default()).map_index(index, opt, f),
+                _ => opt.fail(self, |v| Exn::from(index_type_error(&v, index))),
+            },
+            // jq reads the field first, and only a string names an object's field.
+            Val::Obj(_) if !matches!(index, Val::TStr(_) | Val::BStr(_)) => {
+                opt.fail(self, |v| Exn::from(index_type_error(&v, index)))
+            }
             Val::Obj(ref mut o) => {
                 use indexmap::map::Entry::{Occupied, Vacant};
                 match Rc::make_mut(o).entry(index.clone()) {
@@ -226,14 +457,53 @@ impl jaq_core::ValT for Val {
                 }
                 Ok(self)
             }
+            Val::Arr(_) if !matches!(index, Val::Num(_)) => {
+                opt.fail(self, |v| Exn::from(index_type_error(&v, index)))
+            }
             Val::Arr(ref mut a) => {
-                let oob = || Error::str(format_args!("index {index} out of bounds"));
-                let abs_or = |i| abs_index(i, a.len()).ok_or_else(oob);
-                let i = match index.as_pos_usize().and_then(abs_or) {
+                let oob = || Error::str("Out of bounds negative array index");
+                let len = a.len();
+                // As jq's `jv_set`: the index truncated to an integer (NaN refused), and a
+                // non-negative index past the end extends the array with nulls.
+                let i = match index {
+                    Val::Num(n) if n.as_f64().is_nan() => {
+                        let e = Error::str("Cannot set array element at NaN index");
+                        return opt.fail(self, |_| Exn::from(e));
+                    }
+                    Val::Num(n) => {
+                        let d = n.as_f64().clamp(f64::from(i32::MIN), f64::from(i32::MAX));
+                        #[allow(clippy::cast_possible_truncation)]
+                        let i = d as isize;
+                        num::PosUsize(i >= 0, i.unsigned_abs())
+                    }
+                    _ => num::PosUsize(true, 0),
+                };
+                let abs_or = |i: num::PosUsize| match i {
+                    num::PosUsize(true, i) => Ok(i),
+                    i => abs_index(i, len).ok_or_else(oob),
+                };
+                let i = match abs_or(i) {
                     Ok(i) => i,
                     Err(e) => return opt.fail(self, |_| Exn::from(e)),
                 };
 
+                // jq refuses to grow an array past `INT_MAX >> 2` elements rather than allocate.
+                if i > (i32::MAX >> 2) as usize {
+                    let e = Error::str("Array index too large");
+                    return opt.fail(self, |_| Exn::from(e));
+                }
+                // Deleting past the end leaves the array as it is.
+                if i >= a.len() {
+                    match f(Val::Null).next().transpose()? {
+                        None => return Ok(self),
+                        Some(y) => {
+                            let a = Rc::make_mut(a);
+                            a.resize(i, Val::Null);
+                            a.push(y);
+                            return Ok(self);
+                        }
+                    }
+                }
                 let a = Rc::make_mut(a);
                 let x = core::mem::take(&mut a[i]);
                 if let Some(y) = f(x).next().transpose()? {
@@ -243,7 +513,7 @@ impl jaq_core::ValT for Val {
                 }
                 Ok(self)
             }
-            _ => opt.fail(self, |v| Exn::from(Error::typ(v, Type::Iter.as_str()))),
+            _ => opt.fail(self, |v| Exn::from(index_type_error(&v, index))),
         }
     }
 
@@ -254,8 +524,8 @@ impl jaq_core::ValT for Val {
         f: impl Fn(Self) -> I,
     ) -> ValX<'a> {
         let fs = |b: Bytes, range, skip_take: SkipTakeFn, from: ValBytesFn, into: BytesValFn| {
-            let (skip, take) = match Self::range_int(range) {
-                Ok(range) => skip_take(range, &b),
+            let (skip, take) = match skip_take(range, &b) {
+                Ok(bounds) => bounds,
                 Err(e) => return opt.fail(into(b), |_| Exn::from(e)),
             };
             let str = into(b.slice(skip..skip + take));
@@ -269,8 +539,8 @@ impl jaq_core::ValT for Val {
         let stc = skip_take_chars;
         match self {
             Val::Arr(ref mut a) => {
-                let (skip, take) = match Self::range_int(range) {
-                    Ok(range) => skip_take(range, a.len()),
+                let (skip, take) = match slice_bounds(range, a.len()) {
+                    Ok(bounds) => bounds,
                     Err(e) => return opt.fail(self, |_| Exn::from(e)),
                 };
                 let arr = a.iter().skip(skip).take(take).cloned().collect();
@@ -281,7 +551,10 @@ impl jaq_core::ValT for Val {
             }
             Val::BStr(b) => fs(*b, range, stb, Val::into_byte_str, Val::byte_str),
             Val::TStr(b) => fs(*b, range, stc, Val::into_utf8_str, Val::utf8_str),
-            _ => opt.fail(self, |v| Exn::from(Error::typ(v, Type::Arr.as_str()))),
+            _ => {
+                let slice = slice_object(range);
+                opt.fail(self, |v| Exn::from(index_type_error(&v, &slice)))
+            }
         }
     }
 
@@ -295,6 +568,14 @@ impl jaq_core::ValT for Val {
             Self::BStr(b) | Self::TStr(b) => Self::TStr(b),
             _ => Self::utf8_str(self.to_json()),
         }
+    }
+
+    fn kind_name(&self) -> &'static str {
+        type_name(self)
+    }
+
+    fn dump_trunc(&self) -> String {
+        dump_trunc(self)
     }
 }
 
@@ -354,30 +635,70 @@ pub fn defs() -> impl Iterator<Item = load::parse::Def<&'static str>> {
 
 type ValBytesFn = fn(Val) -> Result<Bytes, Error>;
 type BytesValFn = fn(Bytes) -> Val;
-type SkipTakeFn = fn(val::Range<num::PosUsize>, &[u8]) -> (usize, usize);
+type SkipTakeFn = fn(val::Range<&Val>, &[u8]) -> Result<(usize, usize), Error>;
 
-fn skip_take(range: val::Range<num::PosUsize>, len: usize) -> (usize, usize) {
-    let from = abs_bound(range.start, len, 0);
-    let upto = abs_bound(range.end, len, len);
-    (from, upto.saturating_sub(from))
-}
-
-fn skip_take_bytes(range: val::Range<num::PosUsize>, b: &[u8]) -> (usize, usize) {
-    skip_take(range, b.len())
-}
-
-fn skip_take_chars(range: val::Range<num::PosUsize>, b: &[u8]) -> (usize, usize) {
-    let byte_index = |num::PosUsize(pos, c)| {
-        let mut chars = b.char_indices().map(|(start, ..)| start);
-        if pos {
-            chars.nth(c).unwrap_or(b.len())
-        } else {
-            chars.nth_back(c - 1).unwrap_or(0)
-        }
+/// jq's `parse_slice`: where a slice of `len` elements starts and how many it takes. The bounds
+/// are numbers (or null for the ends); a negative one counts from the end, the start is rounded
+/// down and the end up, and both are clamped to the elements.
+fn slice_bounds(range: val::Range<&Val>, len: usize) -> Result<(usize, usize), Error> {
+    let bound = |bound: Option<&Val>, default: f64| match bound {
+        None | Some(Val::Null) => Ok(default),
+        Some(Val::Num(n)) => Ok(n.as_f64()),
+        Some(_) => Err(Error::str("Array/string slice indices must be integers")),
     };
-    let from_byte = range.start.map_or(0, byte_index);
-    let upto_byte = range.end.map_or(b.len(), byte_index);
-    (from_byte, upto_byte.saturating_sub(from_byte))
+    #[allow(clippy::cast_precision_loss)]
+    let flen = len as f64;
+    let mut dstart = bound(range.start, 0.0)?;
+    let mut dend = bound(range.end, flen)?;
+    if dstart.is_nan() {
+        dstart = 0.0;
+    }
+    if dstart < 0.0 {
+        dstart += flen;
+    }
+    let dstart = dstart.clamp(0.0, flen);
+    #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+    let start = dstart as usize;
+    if dend.is_nan() {
+        dend = flen;
+    }
+    if dend < 0.0 {
+        dend += flen;
+    }
+    if dend < 0.0 {
+        #[allow(clippy::cast_precision_loss)]
+        let start = start as f64;
+        dend = start;
+    }
+    #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+    let mut end = (dend.min(f64::from(i32::MAX)) as usize).min(len);
+    #[allow(clippy::cast_precision_loss)]
+    if end < len && (end as f64) < dend {
+        end += 1;
+    }
+    let end = end.max(start);
+    Ok((start, end - start))
+}
+
+/// The object jq indexes by for a slice: `{"start": ..., "end": ...}`.
+fn slice_object(range: val::Range<&Val>) -> Val {
+    let bound = |b: Option<&Val>| b.cloned().unwrap_or(Val::Null);
+    Val::obj(Map::from_iter([
+        (Val::utf8_str("start"), bound(range.start)),
+        (Val::utf8_str("end"), bound(range.end)),
+    ]))
+}
+
+fn skip_take_bytes(range: val::Range<&Val>, b: &[u8]) -> Result<(usize, usize), Error> {
+    slice_bounds(range, b.len())
+}
+
+fn skip_take_chars(range: val::Range<&Val>, b: &[u8]) -> Result<(usize, usize), Error> {
+    let (skip, take) = slice_bounds(range, b.chars().count())?;
+    let byte_index = |c: usize| b.char_indices().nth(c).map_or(b.len(), |(i, ..)| i);
+    let from = byte_index(skip);
+    let upto = byte_index(skip + take);
+    Ok((from, upto - from))
 }
 
 fn bytes_splice(b: &mut BytesMut, skip: usize, take: usize, replace: &[u8]) {
@@ -396,10 +717,6 @@ fn bytes_splice(b: &mut BytesMut, skip: usize, take: usize, replace: &[u8]) {
 
 /// If a range bound is given, absolutise and clip it between 0 and `len`,
 /// else return `default`.
-fn abs_bound(i: Option<num::PosUsize>, len: usize, default: usize) -> usize {
-    i.map_or(default, |i| core::cmp::min(i.wrap(len).unwrap_or(0), len))
-}
-
 /// Absolutise an index and return result if it is inside [0, len).
 fn abs_index(i: num::PosUsize, len: usize) -> Option<usize> {
     i.wrap(len).filter(|i| *i < len)
@@ -408,7 +725,12 @@ fn abs_index(i: num::PosUsize, len: usize) -> Option<usize> {
 impl Val {
     /// Construct an object value.
     pub fn obj(m: Map) -> Self {
-        Self::Obj(m.into())
+        Self::Obj(Rc::new(Object(m)))
+    }
+
+    /// Construct an array value.
+    pub fn arr(v: Vec<Self>) -> Self {
+        Self::Arr(Rc::new(Array(v)))
     }
 
     /// Construct a string that is interpreted as UTF-8.
@@ -428,12 +750,6 @@ impl Val {
         }
     }
 
-    /// If the value is an integer in [-usize::MAX, +usize::MAX], return it, else fail.
-    fn as_pos_usize(&self) -> Result<num::PosUsize, Error> {
-        let fail = || Error::typ(self.clone(), Type::Int.as_str());
-        self.as_num().and_then(Num::as_pos_usize).ok_or_else(fail)
-    }
-
     fn into_byte_str(self) -> Result<Bytes, Error> {
         match self {
             Self::BStr(b) => Ok(*b),
@@ -449,62 +765,53 @@ impl Val {
     }
 
     /// If the value is an array, return it, else fail.
-    fn into_arr(self) -> Result<Rc<Vec<Self>>, Error> {
+    fn into_arr(self) -> Result<Rc<Array>, Error> {
         match self {
             Self::Arr(a) => Ok(a),
             _ => Err(Error::typ(self, Type::Arr.as_str())),
         }
     }
 
-    fn as_arr(&self) -> Result<&Rc<Vec<Self>>, Error> {
+    fn as_arr(&self) -> Result<&Rc<Array>, Error> {
         match self {
             Self::Arr(a) => Ok(a),
             _ => Err(Error::typ(self.clone(), Type::Arr.as_str())),
         }
     }
 
-    fn range_int(range: val::Range<&Self>) -> Result<val::Range<num::PosUsize>, Error> {
-        let f = |i: Option<&Self>| {
-            i.as_ref()
-                .filter(|i| !matches!(i, Val::Null))
-                .map(|i| i.as_pos_usize())
-                .transpose()
-        };
-        Ok(f(range.start)?..f(range.end)?)
-    }
-
     fn to_json(&self) -> Vec<u8> {
-        let mut buf = write::Buf(Vec::new());
-        write::write_buf(&mut buf, &write::Pp::default(), 0, self).unwrap();
-        buf.0
+        write::to_json(self)
     }
 
     fn index_opt(self, index: &Self) -> Result<Option<Val>, Error> {
         Ok(match (self, index) {
             (Val::Null, _) => None,
-            (Val::BStr(a), Val::Num(i @ (Num::Int(_) | Num::BigInt(_)))) => i
-                .as_pos_usize()
-                .and_then(|i| abs_index(i, a.len()))
-                .map(|i| usize::from(a[i]).into()),
-            (Val::Arr(a), Val::Num(i @ (Num::Int(_) | Num::BigInt(_)))) => i
-                .as_pos_usize()
-                .and_then(|i| abs_index(i, a.len()))
-                .map(|i| a[i].clone()),
+            (Val::BStr(a), Val::Num(i)) => {
+                jq_array_index(i, a.len()).map(|i| usize::from(a[i]).into())
+            }
+            (Val::Arr(a), Val::Num(i)) => jq_array_index(i, a.len()).map(|i| a[i].clone()),
             (Val::Arr(_), Val::Arr(y)) if y.is_empty() => Some(Val::Arr(Default::default())),
             (Val::Arr(x), Val::Arr(y)) => {
                 // adapted from the implementation of the `indices` filter
                 let iw = x.windows(y.len()).enumerate();
-                let indices = iw.filter_map(|(i, w)| (w == **y).then_some(i));
+                let indices = iw.filter_map(|(i, w)| (w == &y[..]).then_some(i));
                 Some(indices.map(Val::from).collect())
             }
-            (Val::Obj(o), i) => o.get(i).cloned(),
+            // jq only ever indexes an object by a string key; a non-string index (`{}[0]`) is a
+            // type error there, not a (guaranteed) miss that quietly reads as `null` — even
+            // though jaq objects can technically hold non-string keys (from `{(0): 1}`-style
+            // construction). This build follows jq's behavior rather than jaq's own, since jq's
+            // behavior is the bar the tool is advertised against; see `index_type_error`'s doc
+            // comment for the exact wording, verified against the oracle for every index type.
+            (Val::Obj(o), i @ (Val::TStr(_) | Val::BStr(_))) => o.get(i).cloned(),
+            (s @ Val::Obj(_), i) => return Err(index_type_error(&s, i)),
             (v @ (Val::BStr(_) | Val::TStr(_) | Val::Arr(_)), Val::Obj(o)) => {
                 use jaq_core::ValT;
                 let start = o.get(&Val::utf8_str("start"));
                 let end = o.get(&Val::utf8_str("end"));
                 return v.range(start..end).map(Some);
             }
-            (s, _) => return Err(Error::index(s, index.clone())),
+            (s, _) => return Err(index_type_error(&s, index)),
         })
     }
 }
@@ -553,12 +860,6 @@ impl FromIterator<Self> for Val {
     }
 }
 
-fn bigint_to_int_saturated(i: &BigInt) -> isize {
-    let (min, max) = (isize::MIN, isize::MAX);
-    i.to_isize()
-        .unwrap_or_else(|| if i.is_negative() { min } else { max })
-}
-
 impl core::ops::Add for Val {
     type Output = ValR;
     fn add(self, rhs: Self) -> Self::Output {
@@ -583,7 +884,7 @@ impl core::ops::Add for Val {
                 Rc::make_mut(&mut l).extend(r.iter().map(|(k, v)| (k.clone(), v.clone())));
                 Ok(Obj(l))
             }
-            (l, r) => Err(Error::math(l, ops::Math::Add, r)),
+            (l, r) => Err(type_error2(&l, &r, "cannot be added")),
         }
     }
 }
@@ -598,48 +899,125 @@ impl core::ops::Sub for Val {
                 Rc::make_mut(&mut l).retain(|x| !r.contains(x));
                 Ok(Self::Arr(l))
             }
-            (l, r) => Err(Error::math(l, ops::Math::Sub, r)),
+            (l, r) => Err(type_error2(&l, &r, "cannot be subtracted")),
         }
     }
 }
 
-fn obj_merge(l: &mut Rc<Map>, r: Rc<Map>) {
-    let l = Rc::make_mut(l);
-    let r = rc_unwrap_or_clone(r).into_iter();
-    r.for_each(|(k, v)| match (l.get_mut(&k), v) {
-        (Some(Val::Obj(l)), Val::Obj(r)) => obj_merge(l, r),
-        (Some(l), r) => *l = r,
-        (None, r) => {
-            l.insert(k, r);
+/// Merge `r` into `l` recursively (`l * r`), without recursing once per level of nesting: an
+/// object being merged into waits on a stack, its merged entry taken out (left `null`) until its
+/// merge is done.
+fn obj_merge(l: &mut Rc<Object>, r: Rc<Object>) {
+    struct Frame {
+        l: Object,
+        r: <Object as IntoIterator>::IntoIter,
+        key: Option<Val>,
+    }
+    let mut stack = Vec::from([Frame {
+        l: core::mem::take(Rc::make_mut(l)),
+        r: rc_unwrap_or_clone(r).into_iter(),
+        key: None,
+    }]);
+    loop {
+        let Some(top) = stack.last_mut() else {
+            return;
+        };
+        match top.r.next() {
+            Some((k, Val::Obj(r))) if matches!(top.l.get(&k), Some(Val::Obj(_))) => {
+                let Some(Val::Obj(l)) = top.l.get_mut(&k).map(core::mem::take) else {
+                    unreachable!()
+                };
+                stack.push(Frame {
+                    l: rc_unwrap_or_clone(l),
+                    r: rc_unwrap_or_clone(r).into_iter(),
+                    key: Some(k),
+                });
+            }
+            Some((k, v)) => {
+                top.l.insert(k, v);
+            }
+            None => {
+                let Some(mut done) = stack.pop() else {
+                    return;
+                };
+                let merged = core::mem::take(&mut done.l);
+                match (stack.last_mut(), done.key.take()) {
+                    (Some(parent), Some(key)) => {
+                        if let Some(slot) = parent.l.get_mut(&key) {
+                            *slot = Val::Obj(Rc::new(merged));
+                        }
+                    }
+                    _ => {
+                        *Rc::make_mut(l) = merged;
+                        return;
+                    }
+                }
+            }
         }
-    });
+    }
+}
+
+/// jq caps a repeated string's result length at `INT_MAX` (its `jv` string length field is a
+/// signed 32-bit int internally, even on a 64-bit host) and refuses to even attempt building a
+/// longer one, rather than let the allocation run. A real process can often still satisfy an
+/// allocation that large (jq's own oracle-verified boundary: `"a" * 1500000000` succeeds,
+/// `"a" * 2147483647` — `INT_MAX` exactly — does not); the sandbox this tool actually runs in
+/// cannot — attempting even the `INT_MAX`-byte case (still under jq's own cap) aborts the whole
+/// component with an allocation failure, unlike jq's own recoverable error. Capped well below
+/// that instead, at the same order of magnitude this tool already uses elsewhere for a
+/// platform-imposed (not jq-imposed) ceiling — e.g. grep's `-f -`/stdin read limit — since jq's
+/// own `INT_MAX` bound is not actually reachable here.
+const MAX_REPEATED_STRING_LEN: usize = 16 * 1024 * 1024;
+
+fn checked_repeat_len(part_len: usize, count: usize) -> Result<usize, Error> {
+    part_len
+        .checked_mul(count)
+        .filter(|&len| len <= MAX_REPEATED_STRING_LEN)
+        .ok_or_else(|| Error::str("Repeat string result too long"))
+}
+
+/// How many times jq 1.8 repeats a string multiplied by `n`: `None` (giving `null`) for a
+/// negative count or NaN, else the count truncated to an integer, `0` giving `""`.
+fn repeat_count(n: &Num) -> Option<usize> {
+    let d = n.as_f64();
+    if d < 0.0 || d.is_nan() {
+        return None;
+    }
+    #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+    Some(if d > f64::from(i32::MAX) {
+        i32::MAX as usize
+    } else {
+        d as usize
+    })
 }
 
 impl core::ops::Mul for Val {
     type Output = ValR;
     fn mul(self, rhs: Self) -> Self::Output {
-        use crate::Num::{BigInt, Int};
         use Val::*;
         match (self, rhs) {
             (Num(x), Num(y)) => Ok(Num(x * y)),
-            (s @ (BStr(_) | TStr(_)), Num(BigInt(i)))
-            | (Num(BigInt(i)), s @ (BStr(_) | TStr(_))) => {
-                s * Num(Int(bigint_to_int_saturated(&i)))
-            }
-            (BStr(s), Num(Int(i))) | (Num(Int(i)), BStr(s)) if i > 0 => {
-                Ok(Self::byte_str(s.repeat(i as usize)))
-            }
-            (TStr(s), Num(Int(i))) | (Num(Int(i)), TStr(s)) if i > 0 => {
-                Ok(Self::utf8_str(s.repeat(i as usize)))
-            }
-            // string multiplication with negatives or 0 results in null
-            // <https://jqlang.github.io/jq/manual/#Builtinoperatorsandfunctions>
-            (BStr(_) | TStr(_), Num(Int(_))) | (Num(Int(_)), BStr(_) | TStr(_)) => Ok(Null),
+            // As jq 1.8 repeats: `"ab" * 1.5` is `"ab"`, `"ab" * 0` is `""` and a negative
+            // count gives `null`.
+            (BStr(s), Num(n)) | (Num(n), BStr(s)) => Ok(match repeat_count(&n) {
+                None => Null,
+                Some(count) => {
+                    checked_repeat_len(s.len(), count)?;
+                    Self::byte_str(s.repeat(count))
+                }
+            }),
+            (TStr(s), Num(n)) | (Num(n), TStr(s)) => Ok(match repeat_count(&n) {
+                None => Null,
+                Some(count) => {
+                    checked_repeat_len(s.len(), count)?;
+                    Self::utf8_str(s.repeat(count))
+                }
+            }),
             (Obj(mut l), Obj(r)) => {
                 obj_merge(&mut l, r);
                 Ok(Obj(l))
             }
-            (l, r) => Err(Error::math(l, ops::Math::Mul, r)),
+            (l, r) => Err(type_error2(&l, &r, "cannot be multiplied")),
         }
     }
 }
@@ -658,6 +1036,17 @@ fn split<'a>(s: &'a [u8], sep: &'a [u8]) -> Box<dyn Iterator<Item = &'a [u8]> + 
     }
 }
 
+/// jq's own wording for `X / 0` or `X % 0` (of any number type, not just integer zero — a float
+/// `0.0` divisor is just as refused): `number (X) and number (Y) cannot be divided[ (remainder)]
+/// because the divisor is zero`. Verified against the oracle for `/` and `%`, integer and float
+/// zero divisors alike.
+fn zero_divisor_error(x: Num, y: Num, remainder: bool) -> Error {
+    let what = if remainder { " (remainder)" } else { "" };
+    Error::str(format_args!(
+        "number ({x}) and number ({y}) cannot be divided{what} because the divisor is zero"
+    ))
+}
+
 impl core::ops::Div for Val {
     type Output = ValR;
     fn div(self, rhs: Self) -> Self::Output {
@@ -665,10 +1054,17 @@ impl core::ops::Div for Val {
             split(&x, &y).map(|s| into(x.slice_ref(s))).collect()
         };
         match (self, rhs) {
+            // jq refuses division by an exact-zero divisor (integer or float) rather than let it
+            // through to the underlying IEEE result — matching jq's own behavior is the bar this
+            // build follows, even where jaq's own upstream deliberately lets it through (jaq-std's
+            // `nan`/`infinite` no longer rely on this; see jaq-std/src/lib.rs).
+            (Self::Num(x), Self::Num(y)) if y == Num::Int(0) => {
+                Err(zero_divisor_error(x, y, false))
+            }
             (Self::Num(x), Self::Num(y)) => Ok(Self::Num(x / y)),
             (Self::TStr(x), Self::TStr(y)) => Ok(fs(*x, *y, Val::utf8_str)),
             (Self::BStr(x), Self::BStr(y)) => Ok(fs(*x, *y, Val::byte_str)),
-            (l, r) => Err(Error::math(l, ops::Math::Div, r)),
+            (l, r) => Err(type_error2(&l, &r, "cannot be divided")),
         }
     }
 }
@@ -677,10 +1073,11 @@ impl core::ops::Rem for Val {
     type Output = ValR;
     fn rem(self, rhs: Self) -> Self::Output {
         match (self, rhs) {
-            (Self::Num(x), Self::Num(y)) if !(x.is_int() && y.is_int() && y == Num::Int(0)) => {
-                Ok(Self::Num(x % y))
+            (Self::Num(x), Self::Num(y)) if y.is_zero_divisor() && !x.as_f64().is_nan() => {
+                Err(zero_divisor_error(x, y, true))
             }
-            (l, r) => Err(Error::math(l, ops::Math::Rem, r)),
+            (Self::Num(x), Self::Num(y)) => Ok(Self::Num(x % y)),
+            (l, r) => Err(type_error2(&l, &r, "cannot be divided (remainder)")),
         }
     }
 }
@@ -690,7 +1087,7 @@ impl core::ops::Neg for Val {
     fn neg(self) -> Self::Output {
         match self {
             Self::Num(n) => Ok(Self::Num(-n)),
-            x => Err(Error::typ(x, Type::Num.as_str())),
+            x => Err(type_error(&x, "cannot be negated")),
         }
     }
 }
@@ -701,15 +1098,22 @@ impl PartialOrd for Val {
     }
 }
 
-impl Ord for Val {
-    fn cmp(&self, other: &Self) -> Ordering {
+/// What comparing two values shallowly tells: their order, or that their elements (an array's
+/// in order, an object's values in the order of its sorted keys) decide it, lexicographically.
+enum Shallow<'a> {
+    Decided(Ordering),
+    Elements(alloc::vec::IntoIter<&'a Val>, alloc::vec::IntoIter<&'a Val>),
+}
+
+impl Val {
+    fn cmp_shallow<'a>(&'a self, other: &'a Self) -> Shallow<'a> {
         use Ordering::{Equal, Greater, Less};
-        match (self, other) {
-            (Self::Null, Self::Null) => Equal,
-            (Self::Bool(x), Self::Bool(y)) => x.cmp(y),
-            (Self::Num(x), Self::Num(y)) => x.cmp(y),
-            (Self::BStr(x) | Self::TStr(x), Self::BStr(y) | Self::TStr(y)) => x.cmp(y),
-            (Self::Arr(x), Self::Arr(y)) => x.cmp(y),
+        Shallow::Decided(match (self, other) {
+            (Self::Arr(x), Self::Arr(y)) => {
+                let l: Vec<_> = x.iter().collect();
+                let r: Vec<_> = y.iter().collect();
+                return Shallow::Elements(l.into_iter(), r.into_iter());
+            }
             (Self::Obj(x), Self::Obj(y)) => match (x.len(), y.len()) {
                 (0, 0) => Equal,
                 (0, _) => Less,
@@ -719,14 +1123,63 @@ impl Ord for Val {
                     let mut r: Vec<_> = y.iter().collect();
                     l.sort_by_key(|(k, _v)| *k);
                     r.sort_by_key(|(k, _v)| *k);
-                    // TODO: make this nicer
                     let kl = l.iter().map(|(k, _v)| k);
                     let kr = r.iter().map(|(k, _v)| k);
-                    let vl = l.iter().map(|(_k, v)| v);
-                    let vr = r.iter().map(|(_k, v)| v);
-                    kl.cmp(kr).then_with(|| vl.cmp(vr))
+                    match kl.cmp(kr) {
+                        Equal => {
+                            let vl: Vec<_> = l.iter().map(|(_k, v)| *v).collect();
+                            let vr: Vec<_> = r.iter().map(|(_k, v)| *v).collect();
+                            return Shallow::Elements(vl.into_iter(), vr.into_iter());
+                        }
+                        ord => ord,
+                    }
                 }
             },
+            (x, y) => x.cmp_scalar(y),
+        })
+    }
+}
+
+impl Ord for Val {
+    /// Compare values, arrays and objects element by element, without recursing once per level
+    /// of nesting.
+    fn cmp(&self, other: &Self) -> Ordering {
+        use Ordering::{Equal, Greater, Less};
+        let mut stack: Vec<(alloc::vec::IntoIter<&Val>, alloc::vec::IntoIter<&Val>)> = Vec::new();
+        let mut pair = Some((self, other));
+        loop {
+            if let Some((x, y)) = pair.take() {
+                match x.cmp_shallow(y) {
+                    Shallow::Decided(Equal) => (),
+                    Shallow::Decided(ord) => return ord,
+                    Shallow::Elements(l, r) => stack.push((l, r)),
+                }
+            }
+            let Some((l, r)) = stack.last_mut() else {
+                return Equal;
+            };
+            match (l.next(), r.next()) {
+                (Some(x), Some(y)) => pair = Some((x, y)),
+                (None, None) => {
+                    stack.pop();
+                }
+                (None, Some(_)) => return Less,
+                (Some(_), None) => return Greater,
+            }
+        }
+    }
+}
+
+impl Val {
+    /// Compare values that are not both arrays or both objects.
+    fn cmp_scalar(&self, other: &Self) -> Ordering {
+        use Ordering::{Equal, Greater, Less};
+        match (self, other) {
+            (Self::Null, Self::Null) => Equal,
+            (Self::Bool(x), Self::Bool(y)) => x.cmp(y),
+            (Self::Num(x), Self::Num(y)) => x.cmp(y),
+            (Self::BStr(x) | Self::TStr(x), Self::BStr(y) | Self::TStr(y)) => x.cmp(y),
+            (Self::Arr(_), Self::Arr(_)) | (Self::Obj(_), Self::Obj(_)) => Equal,
 
             // nulls are smaller than anything else
             (Self::Null, _) => Less,
@@ -747,16 +1200,33 @@ impl Ord for Val {
 }
 
 impl PartialEq for Val {
+    /// Compare values for equality, arrays and objects element by element, without recursing
+    /// once per level of nesting.
     fn eq(&self, other: &Self) -> bool {
-        match (self, other) {
-            (Self::Null, Self::Null) => true,
-            (Self::Bool(x), Self::Bool(y)) => x == y,
-            (Self::Num(x), Self::Num(y)) => x == y,
-            (Self::BStr(x) | Self::TStr(x), Self::BStr(y) | Self::TStr(y)) => x == y,
-            (Self::Arr(x), Self::Arr(y)) => x == y,
-            (Self::Obj(x), Self::Obj(y)) => x == y,
-            _ => false,
+        let mut pairs = Vec::from([(self, other)]);
+        while let Some(pair) = pairs.pop() {
+            match pair {
+                (Self::Null, Self::Null) => (),
+                (Self::Bool(x), Self::Bool(y)) if x == y => (),
+                (Self::Num(x), Self::Num(y)) if x == y => (),
+                (Self::BStr(x) | Self::TStr(x), Self::BStr(y) | Self::TStr(y)) if x == y => (),
+                (Self::Arr(x), Self::Arr(y)) if Rc::ptr_eq(x, y) => (),
+                (Self::Arr(x), Self::Arr(y)) if x.len() == y.len() => {
+                    pairs.extend(x.iter().zip(y.iter()));
+                }
+                (Self::Obj(x), Self::Obj(y)) if Rc::ptr_eq(x, y) => (),
+                (Self::Obj(x), Self::Obj(y)) if x.len() == y.len() => {
+                    for (k, v) in x.iter() {
+                        match y.get(k) {
+                            Some(w) => pairs.push((v, w)),
+                            None => return false,
+                        }
+                    }
+                }
+                _ => return false,
+            }
         }
+        true
     }
 }
 

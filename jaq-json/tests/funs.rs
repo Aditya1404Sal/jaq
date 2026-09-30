@@ -2,18 +2,60 @@
 
 pub mod common;
 
-use common::give;
+use common::{fail, give};
+use jaq_json::Error;
 use serde_json::json;
 
 yields!(bsearch_absent1, "[1, 3] | bsearch(0)", -1);
 yields!(bsearch_absent2, "[1, 3] | bsearch(2)", -2);
 yields!(bsearch_absent3, "[1, 3] | bsearch(4)", -3);
 yields!(bsearch_present, "[1, 3] | [bsearch(1, 3)]", [0, 1]);
+// jq's own search on an unsorted array.
+yields!(
+    bsearch_unsorted,
+    "[3, 2, 1] | [bsearch(2, 3, 0, 4)]",
+    [1, -4, -1, -4]
+);
+
+// FA-070: `"a" * 4294967296` used to abort the whole (sandboxed) process attempting the
+// allocation instead of refusing — jq itself refuses any repeat past `INT_MAX` result bytes,
+// but even a sub-`INT_MAX` allocation this large aborts the sandbox, so the cap here is a real
+// platform limit, well below jq's own (see `MAX_REPEATED_STRING_LEN`'s own doc comment).
+#[test]
+fn string_repeat_refuses_rather_than_aborts() {
+    give(json!(null), r#""ab" | . * 100"#, json!("ab".repeat(100)));
+    fail(
+        json!(null),
+        "\"a\" * 4294967296",
+        Error::str("Repeat string result too long"),
+    );
+}
+
+// Like jq, an index past the end extends the array with nulls, up to jq's limit of
+// `INT_MAX >> 2`; past it jq refuses instead of allocating.
+yields!(
+    index_update_extends,
+    "[] | .[3] = 1",
+    json!([null, null, null, 1])
+);
+yields!(
+    index_update_too_large,
+    "[[536870912, 2147483648, 4294967295][] as $i | try ([] | .[$i] = 1 | length) catch .]",
+    [
+        "Array index too large",
+        "Array index too large",
+        "Array index too large"
+    ]
+);
 
 yields!(
     fromjson_inf,
-    r#""Infinity +Infinity -Infinity" | [fromjson | tostring]"#,
-    ["Infinity", "Infinity", "-Infinity"]
+    r#"["Infinity", "+Infinity", "-Infinity"] | map(fromjson | tostring)"#,
+    [
+        "1.7976931348623157e+308",
+        "1.7976931348623157e+308",
+        "-1.7976931348623157e+308"
+    ]
 );
 yields!(fromjson_uint, r#"" 1" | fromjson"#, 1);
 yields!(fromjson_pint, r#""+1" | fromjson"#, 1);
@@ -72,9 +114,23 @@ yields!(length_float_neg, "-2.5 | length", 2.5);
 
 yields!(tojson_fl0, "1.0 | tojson", "1.0");
 yields!(tojson_fl1, "1.1 | tojson", "1.1");
-yields!(tojson_nan, "0.0 / 0.0 | tojson", "NaN");
-yields!(tojson_inf, "1.0 / 0.0 | tojson", "Infinity");
-yields!(tojson_ninf, "-1.0 / 0.0 | tojson", "-Infinity");
+// These used to construct NaN/Infinity via `0.0/0.0`/`1.0/0.0`/`-1.0/0.0`, but `/` now raises
+// jq's own "divisor is zero" error on an exact-zero divisor (matching real jq) instead of
+// letting it through to the IEEE result. `1e1000` is parsed lazily as an exact decimal, not yet
+// a float; forcing it through an arithmetic op (`+ 0`) converts it to an IEEE double, which
+// overflows to +-infinity, matching jq's own `builtin.jq` (`def infinite: 1e1000;`) — jaq just
+// needs the nudge into arithmetic that jq's eager float parsing does for free.
+yields!(tojson_nan, "((1e1000 + 0) - (1e1000 + 0)) | tojson", "null");
+yields!(
+    tojson_inf,
+    "(1e1000 + 0) | tojson",
+    "1.7976931348623157e+308"
+);
+yields!(
+    tojson_ninf,
+    "(-1e1000 + 0) | tojson",
+    "-1.7976931348623157e+308"
+);
 
 #[test]
 fn tonumber() {
@@ -104,17 +160,19 @@ fn toboolean() {
 
 #[test]
 fn math_rem() {
-    // generated with this command with modification for errors and float rounding
-    // cargo run -- -rn 'def f: -2, -1, 0, 2.1, 3, 2000000001; f as $a | f as $b | "give!(json!(null), \"\($a) / \($b)\", \(try ($a % $b) catch tojson));"'
+    // jq's `%` truncates both sides to integers (`dtoi`) and refuses a divisor that truncates
+    // to 0; each expected value below is real jq 1.8.2's output.
     // TODO: use fail!()?
     give(json!(null), "-2 % -2", json!(0));
     give(json!(null), "-2 % -1", json!(0));
     give(
         json!(null),
         "try (-2 % 0) catch .",
-        json!("cannot calculate -2 % 0"),
+        json!(
+            "number (-2) and number (0) cannot be divided (remainder) because the divisor is zero"
+        ),
     );
-    give(json!(null), "-2 % 2.1", json!(-2.0));
+    give(json!(null), "-2 % 2.1", json!(0));
     give(json!(null), "-2 % 3", json!(-2));
     give(json!(null), "-2 % 2000000001", json!(-2));
     give(json!(null), "-1 % -2", json!(-1));
@@ -122,9 +180,11 @@ fn math_rem() {
     give(
         json!(null),
         "try (-1 % 0) catch .",
-        json!("cannot calculate -1 % 0"),
+        json!(
+            "number (-1) and number (0) cannot be divided (remainder) because the divisor is zero"
+        ),
     );
-    give(json!(null), "-1 % 2.1", json!(-1.0));
+    give(json!(null), "-1 % 2.1", json!(-1));
     give(json!(null), "-1 % 3", json!(-1));
     give(json!(null), "-1 % 2000000001", json!(-1));
     give(json!(null), "0 % -2", json!(0));
@@ -132,38 +192,44 @@ fn math_rem() {
     give(
         json!(null),
         "try (0 % 0) catch .",
-        json!("cannot calculate 0 % 0"),
+        json!(
+            "number (0) and number (0) cannot be divided (remainder) because the divisor is zero"
+        ),
     );
-    give(json!(null), "0 % 2.1", json!(0.0));
+    give(json!(null), "0 % 2.1", json!(0));
     give(json!(null), "0 % 3", json!(0));
     give(json!(null), "0 % 2000000001", json!(0));
-    give(json!(null), "2.1 % -2 | . * 1000 | round", json!(100));
-    give(json!(null), "2.1 % -1 | . * 1000 | round", json!(100));
-    give(json!(null), "2.1 % 0 | isnan", json!(true));
-    give(json!(null), "2.1 % 2.1", json!(0.0));
-    give(json!(null), "2.1 % 3", json!(2.1));
-    give(json!(null), "2.1 % 2000000001", json!(2.1));
+    give(json!(null), "2.1 % -2 | . * 1000 | round", json!(0));
+    give(json!(null), "2.1 % -1 | . * 1000 | round", json!(0));
+    give(
+        json!(null),
+        "try (2.1 % 0) catch .",
+        json!(
+            "number (2.1) and number (0) cannot be divided (remainder) because the divisor is zero"
+        ),
+    );
+    give(json!(null), "2.1 % 2.1", json!(0));
+    give(json!(null), "2.1 % 3", json!(2));
+    give(json!(null), "2.1 % 2000000001", json!(2));
     give(json!(null), "3 % -2", json!(1));
     give(json!(null), "3 % -1", json!(0));
     give(
         json!(null),
         "try (3 % 0) catch .",
-        json!("cannot calculate 3 % 0"),
+        json!(
+            "number (3) and number (0) cannot be divided (remainder) because the divisor is zero"
+        ),
     );
-    give(json!(null), "3 % 2.1 | . * 1000 | round", json!(900));
+    give(json!(null), "3 % 2.1 | . * 1000 | round", json!(1000));
     give(json!(null), "3 % 3", json!(0));
     give(json!(null), "3 % 2000000001", json!(3));
     give(json!(null), "2000000001 % -2", json!(1));
     give(json!(null), "2000000001 % -1", json!(0));
-    give(
-        json!(null),
-        "try (2000000001 % 0) catch .",
-        json!("cannot calculate 2000000001 % 0"),
-    );
+    give(json!(null), "try (2000000001 % 0) catch .", json!("number (2000000001) and number (0) cannot be divided (remainder) because the divisor is zero"));
     give(
         json!(null),
         "2000000001 % 2.1 | . * 1000 | round",
-        json!(1800), // 1000 in jq
+        json!(1000),
     );
     give(json!(null), "2000000001 % 3", json!(0));
     give(json!(null), "2000000001 % 2000000001", json!(0));
@@ -174,3 +240,317 @@ yields!(
     r#"("%FF" | @urid) == ([255] | tobytes | tostring)"#,
     true
 );
+
+// jq 1.8 compatibility: number printing.
+yields!(jq_integral_float, "10 / 2 | tojson", "5");
+yields!(
+    jq_float_forms,
+    "[0.00001 * 1, 1e17 * 1, 1 / 3, 1.5e300 * 1, 123456789012 * 1, 0.0001 * 1] | tojson",
+    "[1e-05,1e+17,0.3333333333333333,1.5e+300,123456789012,0.0001]"
+);
+yields!(
+    jq_decimal_literals,
+    "[1.0, 1.50, 3e2, 3.0e2, 1e-5, 12e-9, 0.050, 1.500e3] | tojson",
+    "[1.0,1.50,3E+2,3.0E+2,0.00001,1.2E-8,0.050,1500]"
+);
+yields!(jq_interpolated_float, r#""\(10 / 4) \(9 / 3)""#, "2.5 3");
+
+// jq 1.8 compatibility: updates create structure through null and past array ends.
+yields!(
+    jq_null_key_update,
+    r#"null | .a.b = 1 | tojson"#,
+    r#"{"a":{"b":1}}"#
+);
+yields!(jq_null_index_update, "null | .[1] = 1 | tojson", "[null,1]");
+yields!(
+    jq_array_extension,
+    "[1] | .[3] = 4 | tojson",
+    "[1,null,null,4]"
+);
+yields!(
+    jq_nested_extension,
+    r#"{"a":[]} | .a[2].b = 1 | tojson"#,
+    r#"{"a":[null,null,{"b":1}]}"#
+);
+yields!(
+    jq_negative_zero_literal,
+    r#""[-0.0]" | fromjson | tojson"#,
+    "[-0.0]"
+);
+yields!(jq_null_slice, "null | .[1:] | tojson", "null");
+yields!(
+    jq_negative_out_of_bounds,
+    "[1] | try (.[-5] = 9) catch .",
+    "Out of bounds negative array index"
+);
+
+// jq 1.8 syntax: `.5` and `1.` literals, escape runs with surrogate pairs, `?//`.
+yields!(
+    jq_dot_numbers,
+    "[.1 + .2, 1., .5e1, 1.50] | tojson",
+    "[0.30000000000000004,1,5,1.50]"
+);
+yields!(jq_surrogate_pair, r#""😀" | explode"#, [128512]);
+yields!(
+    jq_lone_low_surrogate,
+    r#""a\ude00b" | explode"#,
+    [97, 65533, 98]
+);
+yields!(
+    jq_destructuring_alternatives,
+    r#"[[[1,2],{"a":3}] | .[] as [$a,$b] ?// {a:$a} | [$a,$b]] | tojson"#,
+    "[[1,2],[3,null]]"
+);
+yields!(
+    jq_destructuring_alternative_after_error,
+    r#"[[3]] | .[] as [$a] ?// [$b] | if $a != null then error("x") else {$a,$b} end | tojson"#,
+    r#"{"a":null,"b":3}"#
+);
+
+// jq 1.8 definitions jaq lacked.
+yields!(
+    jq_tostream,
+    r#"{"a":[1,{"b":2}],"c":[]} | [tostream] | tojson"#,
+    r#"[[["a",0],1],[["a",1,"b"],2],[["a",1,"b"]],[["a",1]],[["c"],[]],[["c"]]]"#
+);
+yields!(
+    jq_fromstream,
+    r#"{"a":[1,{"b":2}],"c":[]} | fromstream(tostream) | tojson"#,
+    r#"{"a":[1,{"b":2}],"c":[]}"#
+);
+yields!(
+    jq_truncate_stream,
+    "[1 | truncate_stream([[0],1],[[1,0],2],[[1,0]],[[1]])] | tojson",
+    "[[[0],2],[[0]]]"
+);
+yields!(
+    jq_in,
+    "[2 | IN(1, 2), ([1, 5] | IN(.[]; 5, 6))]",
+    [true, true]
+);
+yields!(
+    jq_index,
+    r#"[{"id":1,"v":"a"},{"id":2,"v":"b"}] | INDEX(.id) | tojson"#,
+    r#"{"1":{"id":1,"v":"a"},"2":{"id":2,"v":"b"}}"#
+);
+
+// jq 1.8's `tonumber` and `fromjson`: decNumber's syntax and jq's messages.
+yields!(
+    jq_tonumber,
+    r#"["1", " 1", "nan", "+1", ".5", "-0", "0x10"] | map(try tonumber catch .) | tojson"#,
+    r#"[1,"string (\" 1\") cannot be parsed as a number",null,1,0.5,-0,"string (\"0x10\") cannot be parsed as a number"]"#
+);
+yields!(
+    jq_tonumber_array,
+    "[1] | try tonumber catch .",
+    "array ([1]) cannot be parsed as a number"
+);
+yields!(
+    jq_fromjson_errors,
+    r#"["1 2", "{", "[1,]", "x"] | map(try fromjson catch .)"#,
+    [
+        "Unexpected extra JSON values (while parsing '1 2')",
+        "Unfinished JSON term at EOF at line 1, column 1 (while parsing '{')",
+        "Expected another array element at line 1, column 4 (while parsing '[1,]')",
+        "Invalid numeric literal at EOF at line 1, column 1 (while parsing 'x')"
+    ]
+);
+yields!(
+    jq_fromjson_type,
+    "1 | try fromjson catch .",
+    "number (1) only strings can be parsed"
+);
+yields!(
+    jq_implode_errors,
+    r#"[(["a"] | try implode catch .), ("a" | try implode catch .)]"#,
+    [
+        "string (\"a\") can't be imploded, unicode codepoint needs to be numeric",
+        "implode input must be an array"
+    ]
+);
+
+// jq 1.8 numbers: doubles past 2^53, and the sign of zero.
+yields!(
+    jq_big_int_arithmetic,
+    "[12345678901234567890123] | map(. + 0) | tojson",
+    "[12345678901234568000000]"
+);
+yields!(
+    jq_negative_zero,
+    "[0 * -1, -0.0, 0 / -1, -(0), (-0 | tostring)] | tojson",
+    r#"[-0,0.0,-0,0,"0"]"#
+);
+yields!(jq_rem_truncates, "[5.5 % 2, 5 % 2.5, 1e30 % 7]", [1, 1, 0]);
+
+// jq 1.8 numbers: a computed zero negates to -0, a literal one to 0.
+yields!(
+    jq_zero_negation,
+    "[((1-1) | -.), -(0), ([] | length | -.), (0 | -.)] | tojson",
+    "[-0,0,-0,0]"
+);
+yields!(
+    jq_string_repeat,
+    r#"["ab" * 0, "ab" * 1.5, "ab" * -1] | tojson"#,
+    r#"["","ab",null]"#
+);
+
+// jq 1.8's error wording.
+yields!(
+    jq_iterate_error,
+    "1 | try .[] catch .",
+    "Cannot iterate over number (1)"
+);
+yields!(
+    jq_add_error,
+    "try ({} + 1) catch .",
+    "object ({}) and number (1) cannot be added"
+);
+yields!(
+    jq_negate_error,
+    r#"try (-"a") catch ."#,
+    "string (\"a\") cannot be negated"
+);
+yields!(
+    jq_keys_error,
+    "1 | try keys catch .",
+    "number (1) has no keys"
+);
+yields!(
+    jq_has_error,
+    r#"{} | try has(0) catch ."#,
+    "Cannot check whether object has a number key"
+);
+yields!(
+    jq_contains_kinds,
+    "true | try contains(false) catch .",
+    "boolean (true) and boolean (false) cannot have their containment checked"
+);
+yields!(
+    jq_object_key_error,
+    "1 | try {(.): 2} catch .",
+    "Cannot use number (1) as object key"
+);
+yields!(
+    jq_slice_bounds,
+    "[1,2,3] | [.[1.5:], .[:1.5]] | tojson",
+    "[[2,3],[1,2]]"
+);
+yields!(
+    jq_loc,
+    "$__loc__ | tojson",
+    r#"{"file":"<top-level>","line":1}"#
+);
+yields!(
+    jq_lgamma_r,
+    "[-0.5 | lgamma_r] | tojson",
+    "[[1.2655121234846454,-1]]"
+);
+yields!(
+    jq_delpaths_missing,
+    "{} | delpaths([[\"a\",0]]) | tojson",
+    "{}"
+);
+
+// A value nested far deeper than a native stack could recurse through is compared, contained,
+// merged, written and dropped all the same (a test thread's stack is 2 MiB), and written as jq
+// writes it: what lies deeper than 10,000 levels shows as `<skipped: too deep>`.
+#[test]
+fn deep_values() {
+    let arr = "reduce range(100000) as $i (null; [.])";
+    let obj = "reduce range(100000) as $i (null; {a: .})";
+    give(
+        json!(null),
+        &format!("[{arr}, {arr}] | [.[0] == .[1], .[0] < .[1], (.[0] as $a | $a | contains($a))]"),
+        json!([true, false, true]),
+    );
+    give(
+        json!(null),
+        &format!("{obj} | [. * . | ..] | length"),
+        json!(100001),
+    );
+    give(
+        json!(null),
+        &format!("{arr} | tojson | [length, .[10001:10020]]"),
+        json!([20021, "<skipped: too deep>"]),
+    );
+    give(
+        json!(null),
+        &format!("{arr} | [..] | length"),
+        json!(100001),
+    );
+}
+
+// Long flat chains run without recursing once per element.
+#[test]
+fn long_chains() {
+    let n = 10000;
+    let ones = || core::iter::repeat("1").take(n).collect::<Vec<_>>();
+    give(
+        json!(null),
+        &format!("[{}] | length", ones().join(",")),
+        json!(n),
+    );
+    give(json!(null), &ones().join(" + "), json!(n));
+    give(json!(null), &ones().join(" - "), json!(2 - n as i64));
+    give(json!(null), &vec!["."; n].join(" | "), json!(null));
+    let path = ".a".repeat(n);
+    give(json!({}), &path, json!(null));
+    let binds: String = (0..2000).map(|i| format!("{i} as $x{i} | ")).collect();
+    give(json!(null), &format!("{binds} $x0 + $x1999"), json!(1999));
+    let vars: Vec<_> = (0..3000).map(|i| format!("$a{i}")).collect();
+    let pat = format!("[range(3000)] as [{}] | $a2999", vars.join(", "));
+    give(json!(null), &pat, json!(2999));
+}
+
+// jq runs a binary operator's right operand outermost, a chain's last operand outermost, and an
+// error in the right operand before the left runs; an object's first entry stays outermost.
+#[test]
+fn operand_order() {
+    use common::gives;
+    gives(
+        json!(null),
+        "[(1,2) + (10,20) + (100,200)]",
+        [json!([111, 112, 121, 122, 211, 212, 221, 222])],
+    );
+    give(
+        json!(null),
+        r#"try (error("x") + error("y")) catch ."#,
+        json!("y"),
+    );
+    give(
+        json!(null),
+        r#"[try ((1, error("a")) + (10, 20)) catch .]"#,
+        json!([11, "a"]),
+    );
+    give(
+        json!(null),
+        "[{a: (1,2), b: (3,4)}] | map(.a * 10 + .b)",
+        json!([13, 14, 23, 24]),
+    );
+}
+
+// Colored as jq 1.8 colors: its default styles, commas in their array's or object's style, and
+// an empty array or object styled as one.
+#[test]
+fn ansi_colors() {
+    use jaq_json::write::{write, Pp, Styles};
+    // (`json!` orders the keys.)
+    let value: jaq_json::Val =
+        serde_json::from_value(json!({"a": [1, "x", null, [], {}], "b": 2, "c": {"d": true}}))
+            .unwrap();
+    let pp = Pp {
+        styles: Styles::ansi(),
+        ..Pp::default()
+    };
+    let mut out = Vec::new();
+    write(&mut out, &pp, 0, &value).unwrap();
+    let (o, a) = ("\x1b[1;39m", "\x1b[1;39m");
+    let (k, r) = ("\x1b[1;34m", "\x1b[0m");
+    let expected = format!(
+        "{o}{{{r}{k}\"a\"{r}{o}:{r}{a}[{r}\x1b[0;39m1{r}{a},{r}\x1b[0;32m\"x\"{r}{a},{r}\
+         \x1b[0;90mnull{r}{a},{r}{a}[]{r}{a},{r}{o}{{}}{r}{a}]{r}{o},{r}{k}\"b\"{r}{o}:{r}\
+         \x1b[0;39m2{r}{o},{r}{k}\"c\"{r}{o}:{r}{o}{{{r}{k}\"d\"{r}{o}:{r}\x1b[0;39mtrue{r}{o}}}{r}\
+         {o}}}{r}"
+    );
+    assert_eq!(String::from_utf8(out).unwrap(), expected);
+}
