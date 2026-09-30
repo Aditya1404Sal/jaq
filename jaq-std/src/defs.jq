@@ -16,8 +16,9 @@ def isarray:   . >= []  and . < {};
 def isobject:  . >= {};
 
 # Numbers
-def nan:      0 / 0;
-def infinite: 1 / 0;
+# `nan`/`infinite` are native filters (jaq-std/src/lib.rs), not jq-level definitions: they used
+# to be `0/0`/`1/0`, but `/` now raises jq's own zero-divisor error instead of letting it through
+# to the IEEE result, so getting an actual NaN/Infinity value needs a real primitive.
 def isnan:      . < nan and nan < .;
 def isinfinite: . == infinite or  . == -infinite;
 def isfinite:   isnumber and (isinfinite | not);
@@ -69,10 +70,10 @@ def add: add(.[]);
 # Arrays
 def min_by(f): reduce min_by_or_empty(f) as $x (null; $x);
 def max_by(f): reduce max_by_or_empty(f) as $x (null; $x);
-def min: min_by(.);
-def max: max_by(.);
+def min: reduce min_or_empty as $x (null; $x);
+def max: reduce max_or_empty as $x (null; $x);
 def unique_by(f): [group_by(f)[] | .[0]];
-def unique: unique_by(.);
+def unique: sort | unique_by(.);
 
 # Paths
 def pick(f):
@@ -82,15 +83,22 @@ def pick(f):
 
 def keys: keys_unsorted | sort;
 
-def flatten: [recurse(arrays[]) | select(isarray | not)];
-def flatten($d): if $d > 0 then map(if isarray then flatten($d-1) else [.] end) | add end;
+def _flatten($x): reduce .[] as $i ([];
+  if $i | type == "array" and $x != 0 then . + ($i | _flatten($x - 1)) else . + [$i] end);
+def flatten($x): if $x < 0 then error("flatten depth must not be negative") else _flatten($x) end;
+def flatten: _flatten(-1);
 
 # Regular expressions
 def capture_of_match: map(select(.name) | { (.name): .string} ) | add + {};
 
 def    test(re; flags): matches(re; flags) | any;
-def    scan(re; flags): matches(re; flags)[] | .[0].string;
+# `scan` always finds every match, the same way `gsub` above always finds every match to
+# substitute — regardless of whether the caller's own `flags` argument happens to include
+# `g` for "global" (verified against the oracle: `scan(re; "")` finds all matches, not
+# just the first, same as `scan(re)`).
 def   match(re; flags): matches(re; flags)[] | .[0] + { captures: .[1:] };
+def    scan(re; flags): match(re; "g" + flags) |
+  if .captures != [] then [.captures[].string] else .string end;
 def capture(re; flags): matches(re; flags)[] | capture_of_match;
 
 def split($sep):
@@ -105,15 +113,24 @@ def sub(re; f; flags):
 
 def gsub(re; f; flags): sub(re; f; "g" + flags);
 
-def    test(re):    test(re; "");
-def    scan(re):    scan(re; "");
-def   match(re):   match(re; "");
-def capture(re): capture(re; "");
+def test($val): ($val | type) as $vt | if $vt == "string" then test($val; null)
+  elif $vt == "array" and $val != [] then test($val[0]; $val[1])
+  else error($vt + " not a string or array") end;
+def    scan(re):    scan(re; null);
+def match($val): ($val | type) as $vt | if $vt == "string" then match($val; null)
+  elif $vt == "array" and $val != [] then match($val[0]; $val[1])
+  else error($vt + " not a string or array") end;
+def capture($val): ($val | type) as $vt | if $vt == "string" then capture($val; null)
+  elif $vt == "array" and $val != [] then capture($val[0]; $val[1])
+  else error($vt + " not a string or array") end;
 def  splits(re):  splits(re; "");
 def  sub(re; f): sub(re; f;  "");
 def gsub(re; f): sub(re; f; "g");
 
 # Date
+# jq 1.8's ISO 8601 conversions: whole seconds only
+def fromdateiso8601: strptime("%Y-%m-%dT%H:%M:%SZ") | mktime;
+def todateiso8601: strftime("%Y-%m-%dT%H:%M:%SZ");
 def   todate:   todateiso8601;
 def fromdate: fromdateiso8601;
 
@@ -126,3 +143,14 @@ def @uri    : tostring | encode_uri;
 def @urid   : tostring | decode_uri;
 def @base64 : tostring | encode_base64;
 def @base64d: tostring | decode_base64;
+
+# jq's SQL-style operators
+def INDEX(stream; idx_expr): reduce stream as $row ({}; .[$row | idx_expr | tostring] = $row);
+def INDEX(idx_expr): INDEX(.[]; idx_expr);
+def JOIN($idx; idx_expr): [.[] | [., $idx[idx_expr]]];
+def JOIN($idx; stream; idx_expr): stream | [., $idx[idx_expr]];
+def JOIN($idx; stream; idx_expr; join_expr): stream | [., $idx[idx_expr]] | join_expr;
+def IN(s): any(s == .; .);
+def IN(src; s): any(src == s; .);
+
+def trimstr($val): ltrimstr($val) | rtrimstr($val);

@@ -44,9 +44,13 @@ yields!(
 );
 
 // here, we diverge from jq, which returns just 1
-yields!(flatten_obj, "{a: 1} | flatten", json!([{"a": 1}]));
-// jq gives an error here
-yields!(flatten_num, "0 | flatten", [0]);
+// as jq, through `.[]`
+yields!(flatten_obj, "{a: 1} | flatten", json!([1]));
+yields!(
+    flatten_num,
+    "0 | try flatten catch .",
+    "Cannot iterate over number (0)"
+);
 
 yields!(isfinite_true, "all((0, 1, nan); isfinite)", true);
 yields!(
@@ -147,7 +151,8 @@ fn recurse_arr() {
 yields!(
     recurse_fib_100,
     "def fib: recurse([.[1], add])[0]; nth(100; [0, 1] | fib) | tostring",
-    "354224848179261915075"
+    // jq adds in doubles past 2^53
+    "354224848179262000000"
 );
 
 // the implementation of scalb in jq (or the libm.a library) doesn't
@@ -166,7 +171,8 @@ yields!(
 yields!(
     scalb_range,
     "[scalb(-2.5, 0, 2.5; 2, 2.5, 3) * 1000 | round]",
-    [-10000, -14142, -20000, 0, 0, 0, 10000, 14142, 20000]
+    // the exponent outermost, as jq runs `x * pow(2; e)`'s right operand first
+    [-10000, 0, 10000, -14142, 0, 14142, -20000, 0, 20000]
 );
 
 // here we diverge from jq, which returns ["a", "b", "a", "A", "b", "B"]

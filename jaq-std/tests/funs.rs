@@ -18,14 +18,15 @@ yields!(
 );
 yields!(
     fromdate_mu,
-    r#""1970-01-02T00:00:00.123456Z" | fromdateiso8601"#,
-    86400.123456
+    r#""1970-01-02T00:00:00.123456Z" | try fromdateiso8601 catch ."#,
+    // jq 1.8 takes whole seconds only
+    "date \"1970-01-02T00:00:00.123456Z\" does not match format \"%Y-%m-%dT%H:%M:%SZ\""
 );
 yields!(todate, r#"86400 | todateiso8601"#, "1970-01-02T00:00:00Z");
 yields!(
     todate_mu,
     "86400.123456 | todateiso8601",
-    "1970-01-02T00:00:00.123456Z"
+    "1970-01-02T00:00:00Z"
 );
 yields!(
     strftime,
@@ -48,17 +49,30 @@ yields!(
     r"86400.123456 | gmtime",
     json!([1970, 0, 2, 0, 0, 0.123456, 5, 1])
 );
-yields!(
-    gmtime_mktime_mu,
-    r"86400.123456 | gmtime | mktime",
-    86400.123456
-);
+yields!(gmtime_mktime_mu, r"86400.123456 | gmtime | mktime", 86400);
 yields!(
     strptime,
     r#""1970-01-02T00:00:00Z" | strptime("%Y-%m-%dT%H:%M:%SZ")"#,
     [1970, 0, 2, 0, 0, 0, 5, 1]
 );
 yields!(mktime, "[ 1970, 0, 2, 0, 0, 0, 5, 1 ] | mktime", 86400);
+// Without a date, jq's `struct tm` of zeros: 1900, January, day 0, and jq's markers for the
+// days of the week and year it cannot compute.
+yields!(
+    strptime_time_only,
+    r#""10:15" | strptime("%H:%M")"#,
+    [1900, 0, 0, 10, 15, 0, 8, 367]
+);
+yields!(
+    strptime_time_only_mktime,
+    r#""10:15" | strptime("%H:%M") | mktime"#,
+    -2209038300_i64
+);
+yields!(
+    strptime_date,
+    r#""2015-03-05" | strptime("%Y-%m-%d")"#,
+    [2015, 2, 5, 0, 0, 0, 4, 63]
+);
 
 #[test]
 fn fromtodate() {
@@ -66,7 +80,12 @@ fn fromtodate() {
     let iso = "2000-01-01T00:00:00Z";
     give(json!(iso), fromto, json!(iso));
     let iso_mu = "2000-01-01T00:00:00.123456Z";
-    give(json!(iso_mu), fromto, json!(iso_mu));
+    let error = format!("date \"{iso_mu}\" does not match format \"%Y-%m-%dT%H:%M:%SZ\"");
+    give(
+        json!(iso_mu),
+        &format!("try ({fromto}) catch ."),
+        json!(error),
+    );
 }
 
 #[test]
@@ -78,7 +97,12 @@ fn explode_implode() {
     give(json!("y̆"), "explode | implode", json!("y̆"));
 }
 
-yields!(implode_invalid, "[1114112] | try implode catch -1", -1);
+// jq replaces a number that is not a Unicode scalar value with U+FFFD
+yields!(
+    implode_invalid,
+    "[1114112, 55296, -1] | implode",
+    "\u{FFFD}\u{FFFD}\u{FFFD}"
+);
 
 yields!(
     encode_base64,
@@ -140,6 +164,13 @@ yields!(
     [10.0, 11.0, 12.0, 13.0, 7.0, 8.0, 8.0, 9.0]
 );
 
+// jq ignores the case of every letter, not only ASCII ones.
+yields!(
+    regex_unicode_case,
+    r#"["É" | test("é"; "i"), test("[é]"; "i"), test("é"), ("ÉCOLE" | test("école"; "i"))]"#,
+    [true, true, false, true]
+);
+
 #[test]
 #[allow(clippy::zero_prefixed_literal)]
 fn regex() {
@@ -196,11 +227,7 @@ yields!(ceili_floor, "-1.4 | ceil ", -1);
 
 yields!(round_nan, "nan | round | isnan", true);
 yields!(round_inf, "infinite | round | isinfinite", true);
-yields!(
-    round_large,
-    "2e22 | round | tostring",
-    "20000000000000000000000"
-);
+yields!(round_large, "2e22 | round | tostring", "2e+22");
 
 yields!(
     sort_break_out,
